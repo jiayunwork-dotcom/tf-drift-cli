@@ -6,8 +6,8 @@ import (
 	"github.com/tf-drift/tf-drift/internal/models"
 )
 
-func FormatJSON(report *models.DriftReport) (string, error) {
-	data := reportToDict(report)
+func FormatJSON(report *models.DriftReport, opts *models.ReportOptions) (string, error) {
+	data := reportToDict(report, opts)
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return "", err
@@ -15,17 +15,22 @@ func FormatJSON(report *models.DriftReport) (string, error) {
 	return string(b), nil
 }
 
-func reportToDict(report *models.DriftReport) map[string]interface{} {
+func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[string]interface{} {
 	results := make([]map[string]interface{}, len(report.Results))
 	for i, r := range report.Results {
 		results[i] = resultToDict(r)
 	}
 
-	return map[string]interface{}{
+	base := map[string]interface{}{
 		"timestamp":   report.Timestamp,
 		"state_file":  report.StateFile,
 		"config_dir":  report.ConfigDir,
 		"workspace":   report.Workspace,
+		"options": map[string]interface{}{
+			"group_by": opts.GroupBy,
+			"min_risk": string(opts.MinRisk),
+			"sort":     opts.Sort,
+		},
 		"summary": map[string]interface{}{
 			"total_resources_in_state":  report.TotalResourcesInState,
 			"total_resources_in_config": report.TotalResourcesInConfig,
@@ -38,6 +43,26 @@ func reportToDict(report *models.DriftReport) map[string]interface{} {
 		"results":            results,
 		"environment_diffs":  report.EnvironmentDiffs,
 	}
+
+	groups := report.GroupResults(opts.GroupBy)
+	if groups != nil {
+		groupData := make([]map[string]interface{}, len(groups))
+		for i, g := range groups {
+			groupResults := make([]map[string]interface{}, len(g.Results))
+			for j, r := range g.Results {
+				groupResults[j] = resultToDict(r)
+			}
+			groupData[i] = map[string]interface{}{
+				"group_name":    g.GroupName,
+				"resource_cnt":  g.ResourceCnt,
+				"drift_cnt":     g.DriftCnt,
+				"results":       groupResults,
+			}
+		}
+		base["groups"] = groupData
+	}
+
+	return base
 }
 
 func resultToDict(result *models.DriftResult) map[string]interface{} {

@@ -44,7 +44,7 @@ var driftTypeColors = map[models.DriftType]string{
 	models.DriftTypeMismatch:     colorYellow,
 }
 
-func FormatTerminal(report *models.DriftReport) string {
+func FormatTerminal(report *models.DriftReport, opts *models.ReportOptions) string {
 	var sb strings.Builder
 
 	printHeader(&sb, report)
@@ -58,8 +58,18 @@ func FormatTerminal(report *models.DriftReport) string {
 	fmt.Fprintf(&sb, "\n%sDrift Details%s (%d resources affected)\n\n",
 		colorBold, colorReset, len(report.Results))
 
-	for _, result := range report.Results {
-		printResourceDrift(&sb, result)
+	groups := report.GroupResults(opts.GroupBy)
+	if groups != nil {
+		for _, group := range groups {
+			printGroupHeaderTerminal(&sb, group)
+			for _, result := range group.Results {
+				printResourceDrift(&sb, result)
+			}
+		}
+	} else {
+		for _, result := range report.Results {
+			printResourceDrift(&sb, result)
+		}
 	}
 
 	if len(report.EnvironmentDiffs) > 0 {
@@ -67,6 +77,20 @@ func FormatTerminal(report *models.DriftReport) string {
 	}
 
 	return sb.String()
+}
+
+func printGroupHeaderTerminal(sb *strings.Builder, group *models.GroupResult) {
+	fmt.Fprintf(sb, "\n%s%s═%s %s%s%s  %s(%d resources, %d drifts)%s\n\n",
+		colorCyan+colorBold,
+		strings.Repeat("═", 2),
+		colorReset,
+		colorBold+colorCyan,
+		group.GroupName,
+		colorReset,
+		colorDim,
+		group.ResourceCnt,
+		group.DriftCnt,
+		colorReset)
 }
 
 func printHeader(sb *strings.Builder, report *models.DriftReport) {

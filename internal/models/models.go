@@ -318,6 +318,173 @@ func (r *DriftReport) SortResults() {
 	}
 }
 
+type ReportOptions struct {
+	GroupBy string
+	MinRisk RiskLevel
+	Sort    string
+}
+
+type GroupResult struct {
+	GroupName   string
+	Results     []*DriftResult
+	ResourceCnt int
+	DriftCnt    int
+}
+
+func NewReportOptions() *ReportOptions {
+	return &ReportOptions{
+		GroupBy: "none",
+		MinRisk: RiskLow,
+		Sort:    "risk",
+	}
+}
+
+func (r *DriftReport) FilterByRisk(minRisk RiskLevel) *DriftReport {
+	filtered := &DriftReport{
+		Timestamp:              r.Timestamp,
+		StateFile:              r.StateFile,
+		ConfigDir:              r.ConfigDir,
+		Workspace:              r.Workspace,
+		TotalResourcesInState:  r.TotalResourcesInState,
+		TotalResourcesInConfig: r.TotalResourcesInConfig,
+		BaselineFile:           r.BaselineFile,
+		IgnoredCount:           r.IgnoredCount,
+		EnvironmentDiffs:       r.EnvironmentDiffs,
+	}
+
+	minOrder := minRisk.Order()
+	for _, res := range r.Results {
+		var filteredDrifts []*DriftItem
+		for _, d := range res.Drifts {
+			if d.RiskLevel.Order() <= minOrder {
+				filteredDrifts = append(filteredDrifts, d)
+			}
+		}
+		if len(filteredDrifts) > 0 {
+			newRes := &DriftResult{
+				ResourceAddr:      res.ResourceAddr,
+				ResourceType:      res.ResourceType,
+				Drifts:            filteredDrifts,
+				ImpactedResources: res.ImpactedResources,
+				Remediations:      res.Remediations,
+			}
+			newRes.ComputeMaxRisk()
+			filtered.Results = append(filtered.Results, newRes)
+		}
+	}
+
+	filtered.ComputeSummary()
+	return filtered
+}
+
+func (r *DriftReport) SortResultsCustom(sortMode string) {
+	switch sortMode {
+	case "count":
+		sort.Slice(r.Results, func(i, j int) bool {
+			ci := len(r.Results[i].Drifts)
+			cj := len(r.Results[j].Drifts)
+			if ci != cj {
+				return ci > cj
+			}
+			ri := r.Results[i].MaxRisk.Order()
+			rj := r.Results[j].MaxRisk.Order()
+			if ri != rj {
+				return ri < rj
+			}
+			return r.Results[i].ResourceAddr < r.Results[j].ResourceAddr
+		})
+	default:
+		sort.Slice(r.Results, func(i, j int) bool {
+			ri := r.Results[i].MaxRisk.Order()
+			rj := r.Results[j].MaxRisk.Order()
+			if ri != rj {
+				return ri < rj
+			}
+			return r.Results[i].ResourceAddr < r.Results[j].ResourceAddr
+		})
+	}
+
+	for _, res := range r.Results {
+		sort.Slice(res.Drifts, func(i, j int) bool {
+			di := res.Drifts[i].DriftType.SeverityOrder()
+			dj := res.Drifts[j].DriftType.SeverityOrder()
+			if di != dj {
+				return di < dj
+			}
+			return res.Drifts[i].AttributePath < res.Drifts[j].AttributePath
+		})
+	}
+}
+
+func (r *DriftReport) GroupResults(groupBy string) []*GroupResult {
+	if groupBy != "resource_type" && groupBy != "module" {
+		return nil
+	}
+
+	groupMap := make(map[string]*GroupResult)
+	var groupOrder []string
+
+	for _, res := range r.Results {
+		var groupKey string
+		switch groupBy {
+		case "resource_type":
+			groupKey = res.ResourceType
+			if groupKey == "" {
+				groupKey = "unknown"
+			}
+		case "module":
+			addr := res.ResourceAddr
+			if strings.HasPrefix(addr, "module.") {
+				parts := strings.SplitN(addr, ".", 3)
+				if len(parts) >= 2 {
+					groupKey = "module." + parts[1]
+				} else {
+					groupKey = "root"
+				}
+			} else {
+				groupKey = "root"
+			}
+		}
+
+		if _, exists := groupMap[groupKey]; !exists {
+			groupMap[groupKey] = &GroupResult{
+				GroupName: groupKey,
+				Results:   []*DriftResult{},
+			}
+			groupOrder = append(groupOrder, groupKey)
+		}
+		groupMap[groupKey].Results = append(groupMap[groupKey].Results, res)
+		groupMap[groupKey].ResourceCnt++
+		groupMap[groupKey].DriftCnt += len(res.Drifts)
+	}
+
+	sort.Slice(groupOrder, func(i, j int) bool {
+		gi := groupMap[groupOrder[i]]
+		gj := groupMap[groupOrder[j]]
+		if gi.DriftCnt != gj.DriftCnt {
+			return gi.DriftCnt > gj.DriftCnt
+		}
+		return gi.GroupName < gj.GroupName
+	})
+
+	for _, grp := range groupMap {
+		sort.Slice(grp.Results, func(i, j int) bool {
+			ri := grp.Results[i].MaxRisk.Order()
+			rj := grp.Results[j].MaxRisk.Order()
+			if ri != rj {
+				return ri < rj
+			}
+			return grp.Results[i].ResourceAddr < grp.Results[j].ResourceAddr
+		})
+	}
+
+	result := make([]*GroupResult, len(groupOrder))
+	for i, key := range groupOrder {
+		result[i] = groupMap[key]
+	}
+	return result
+}
+
 type EnvironmentDiff struct {
 	ResourceAddr     string
 	AttributePath    string

@@ -83,6 +83,9 @@ func cmdDetect(args []string) {
 	baselineSave := fs.Bool("baseline", false, "Save current results as baseline")
 	baselineCompare := fs.String("baseline-compare", "", "Compare against a baseline file (incremental mode)")
 	noConfig := fs.Bool("no-config", false, "Ignore .tfdrift.yaml config file")
+	groupBy := fs.String("group-by", "none", "Group results by (none/resource_type/module)")
+	minRisk := fs.String("min-risk", "low", "Minimum risk level to show (low/medium/high)")
+	sortMode := fs.String("sort", "risk", "Sort mode (risk/count)")
 	fs.Parse(args)
 
 	if *stateFile == "" && *configDir == "" && *noConfig == false {
@@ -168,6 +171,28 @@ func cmdDetect(args []string) {
 	report.ComputeSummary()
 	report.SortResults()
 
+	opts := models.NewReportOptions()
+	if *groupBy != "" {
+		opts.GroupBy = *groupBy
+	}
+	switch strings.ToLower(*minRisk) {
+	case "high":
+		opts.MinRisk = models.RiskHigh
+	case "medium":
+		opts.MinRisk = models.RiskMedium
+	default:
+		opts.MinRisk = models.RiskLow
+	}
+	if *sortMode != "" {
+		opts.Sort = *sortMode
+	}
+
+	displayReport := report
+	if opts.MinRisk != models.RiskLow {
+		displayReport = report.FilterByRisk(opts.MinRisk)
+	}
+	displayReport.SortResultsCustom(opts.Sort)
+
 	if *baselineSave {
 		baselinePath := filepath.Join(baselineDir, "baseline.json")
 		if err := os.MkdirAll(baselineDir, 0755); err != nil {
@@ -183,13 +208,13 @@ func cmdDetect(args []string) {
 
 	switch *format {
 	case "json":
-		content, formatErr = reporters.FormatJSON(report)
+		content, formatErr = reporters.FormatJSON(displayReport, opts)
 	case "markdown":
-		content = reporters.FormatMarkdown(report)
+		content = reporters.FormatMarkdown(displayReport, opts)
 	case "html":
-		content = reporters.FormatHTML(report)
+		content = reporters.FormatHTML(displayReport, opts)
 	default:
-		content = reporters.FormatTerminal(report)
+		content = reporters.FormatTerminal(displayReport, opts)
 	}
 
 	if formatErr != nil {
@@ -207,7 +232,7 @@ func cmdDetect(args []string) {
 		threshold = "any"
 	}
 
-	ec := getExitCode(report, threshold)
+	ec := getExitCode(displayReport, threshold)
 	if ec != 0 {
 		os.Exit(ec)
 	}

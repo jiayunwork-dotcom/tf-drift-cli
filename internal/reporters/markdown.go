@@ -23,7 +23,7 @@ var driftTypeLabel = map[models.DriftType]string{
 	models.DriftTypeMismatch:     "Type Mismatch",
 }
 
-func FormatMarkdown(report *models.DriftReport) string {
+func FormatMarkdown(report *models.DriftReport, opts *models.ReportOptions) string {
 	var sb strings.Builder
 
 	sb.WriteString("# Terraform Drift Detection Report\n\n")
@@ -56,53 +56,17 @@ func FormatMarkdown(report *models.DriftReport) string {
 
 	sb.WriteString("## Drift Details\n\n")
 
-	for _, result := range report.Results {
-		riskIcon := riskEmoji[result.MaxRisk]
-		fmt.Fprintf(&sb, "### %s `%s` — **%s** RISK\n\n",
-			riskIcon, result.ResourceAddr, strings.ToUpper(string(result.MaxRisk)))
-
-		sb.WriteString("| Type | Attribute | Config Value | State Value | Risk |\n")
-		sb.WriteString("|------|-----------|-------------|-------------|------|\n")
-
-		sort.Slice(result.Drifts, func(i, j int) bool {
-			return result.Drifts[i].DriftType.SeverityOrder() < result.Drifts[j].DriftType.SeverityOrder()
-		})
-
-		for _, drift := range result.Drifts {
-			dtype := driftTypeLabel[drift.DriftType]
-			riskIconD := riskEmoji[drift.RiskLevel]
-			cv := fmtValueMD(drift.ConfigValue)
-			sv := fmtValueMD(drift.StateValue)
-			fmt.Fprintf(&sb, "| %s | `%s` | %s | %s | %s %s |\n",
-				dtype, drift.AttributePath, cv, sv, riskIconD, drift.RiskLevel)
-		}
-		sb.WriteString("\n")
-
-		if len(result.Remediations) > 0 {
-			sb.WriteString("**Remediation:**\n\n")
-			for _, rem := range result.Remediations {
-				if rem.Recommended != nil {
-					desc := rem.Recommended.Description
-					cmd := rem.Recommended.Command
-					fmt.Fprintf(&sb, "- %s\n", desc)
-					if cmd != "" && !strings.HasPrefix(cmd, "#") {
-						sb.WriteString("  ```bash\n")
-						fmt.Fprintf(&sb, "  %s\n", cmd)
-						sb.WriteString("  ```\n")
-					}
-				}
+	groups := report.GroupResults(opts.GroupBy)
+	if groups != nil {
+		for _, group := range groups {
+			printGroupMarkdown(&sb, group)
+			for _, result := range group.Results {
+				printResourceDriftMarkdown(&sb, result)
 			}
-			sb.WriteString("\n")
 		}
-
-		if len(result.ImpactedResources) > 0 {
-			sb.WriteString("**Impact Analysis:**\n\n")
-			for _, imp := range result.ImpactedResources {
-				pathStr := strings.Join(imp.PropagationPath, " → ")
-				fmt.Fprintf(&sb, "- L%d: `%s` (via %s)\n",
-					imp.Level, imp.ResourceAddr, pathStr)
-			}
-			sb.WriteString("\n")
+	} else {
+		for _, result := range report.Results {
+			printResourceDriftMarkdown(&sb, result)
 		}
 	}
 
@@ -137,6 +101,63 @@ func FormatMarkdown(report *models.DriftReport) string {
 	return sb.String()
 }
 
+func printGroupMarkdown(sb *strings.Builder, group *models.GroupResult) {
+	fmt.Fprintf(sb, "---\n\n### 📁 %s  \n*%d resources, %d drifts*\n\n",
+		group.GroupName,
+		group.ResourceCnt,
+		group.DriftCnt)
+}
+
+func printResourceDriftMarkdown(sb *strings.Builder, result *models.DriftResult) {
+	riskIcon := riskEmoji[result.MaxRisk]
+	fmt.Fprintf(sb, "#### %s `%s` — **%s** RISK\n\n",
+		riskIcon, result.ResourceAddr, strings.ToUpper(string(result.MaxRisk)))
+
+	sb.WriteString("| Type | Attribute | Config Value | State Value | Risk |\n")
+	sb.WriteString("|------|-----------|-------------|-------------|------|\n")
+
+	sort.Slice(result.Drifts, func(i, j int) bool {
+		return result.Drifts[i].DriftType.SeverityOrder() < result.Drifts[j].DriftType.SeverityOrder()
+	})
+
+	for _, drift := range result.Drifts {
+		dtype := driftTypeLabel[drift.DriftType]
+		riskIconD := riskEmoji[drift.RiskLevel]
+		cv := fmtValueMD(drift.ConfigValue)
+		sv := fmtValueMD(drift.StateValue)
+		fmt.Fprintf(sb, "| %s | `%s` | %s | %s | %s %s |\n",
+			dtype, drift.AttributePath, cv, sv, riskIconD, drift.RiskLevel)
+	}
+	sb.WriteString("\n")
+
+	if len(result.Remediations) > 0 {
+		sb.WriteString("**Remediation:**\n\n")
+		for _, rem := range result.Remediations {
+			if rem.Recommended != nil {
+				desc := rem.Recommended.Description
+				cmd := rem.Recommended.Command
+				fmt.Fprintf(sb, "- %s\n", desc)
+				if cmd != "" && !strings.HasPrefix(cmd, "#") {
+					sb.WriteString("  ```bash\n")
+					fmt.Fprintf(sb, "  %s\n", cmd)
+					sb.WriteString("  ```\n")
+				}
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(result.ImpactedResources) > 0 {
+		sb.WriteString("**Impact Analysis:**\n\n")
+		for _, imp := range result.ImpactedResources {
+			pathStr := strings.Join(imp.PropagationPath, " → ")
+			fmt.Fprintf(sb, "- L%d: `%s` (via %s)\n",
+				imp.Level, imp.ResourceAddr, pathStr)
+		}
+		sb.WriteString("\n")
+	}
+}
+
 func fmtValueMD(v interface{}) string {
 	s := models.SerializeValue(v)
 	s = strings.ReplaceAll(s, "|", "\\|")
@@ -146,7 +167,7 @@ func fmtValueMD(v interface{}) string {
 	return s
 }
 
-func FormatHTML(report *models.DriftReport) string {
+func FormatHTML(report *models.DriftReport, opts *models.ReportOptions) string {
 	var sb strings.Builder
 
 	sb.WriteString(`<!DOCTYPE html>
@@ -159,6 +180,8 @@ func FormatHTML(report *models.DriftReport) string {
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; background: #f8fafc; color: #1e293b; }
 .container { max-width: 1200px; margin: 0 auto; }
 h1 { color: #0f172a; border-bottom: 2px solid #e2e8f0; padding-bottom: 12px; }
+h2.group-title { background: linear-gradient(135deg, #0891b2, #06b6d4); color: white; padding: 12px 20px; border-radius: 8px; margin-top: 24px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+h2.group-title .group-stats { font-size: 14px; font-weight: 400; opacity: 0.9; }
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0; }
 .summary-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); text-align: center; }
 .summary-card .value { font-size: 24px; font-weight: 700; }
@@ -207,68 +230,26 @@ code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 13p
 	fmt.Fprintf(&sb, `<div class="summary-card"><div class="value">%d</div><div class="label">Config Resources</div></div>`, report.TotalResourcesInConfig)
 	sb.WriteString("</div>")
 
+	panelIndex := 0
+
 	if len(report.Results) == 0 {
 		sb.WriteString(`<div style="text-align:center;padding:40px;background:white;border-radius:8px;">`)
 		sb.WriteString(`<h2 style="color:#16a34a">✅ No Drift Detected!</h2>
 </div>`)
 	} else {
-		for i, result := range report.Results {
-			riskClass := fmt.Sprintf("risk-%s", result.MaxRisk)
-			sb.WriteString(`<div class="details-panel">`)
-			sb.WriteString(fmt.Sprintf(`<div class="details-header" onclick="togglePanel('panel-%d')">`, i))
-			sb.WriteString(fmt.Sprintf(`<span class="arrow" id="arrow-%d">▶</span>`, i))
-			sb.WriteString(fmt.Sprintf(`<span class="badge %s">%s</span>`, riskClass, strings.ToUpper(string(result.MaxRisk))))
-			sb.WriteString(fmt.Sprintf(`<code>%s</code>`, result.ResourceAddr))
-			sb.WriteString(fmt.Sprintf(`<span style="color:#64748b">(%d drifts)</span>`, len(result.Drifts)))
-			sb.WriteString(`</div>`)
-
-			sb.WriteString(fmt.Sprintf(`<div class="details-content" id="panel-%d">`, i))
-
-			sb.WriteString(`<table><tr><th>Type</th><th>Attribute</th><th>Config</th><th>State</th><th>Risk</th></tr>`)
-
-			sort.Slice(result.Drifts, func(i, j int) bool {
-				return result.Drifts[i].DriftType.SeverityOrder() < result.Drifts[j].DriftType.SeverityOrder()
-			})
-
-			for _, drift := range result.Drifts {
-				dtype := driftTypeLabel[drift.DriftType]
-				riskD := fmt.Sprintf("risk-%s", drift.RiskLevel)
-				cv := escapeHTML(models.SerializeValue(drift.ConfigValue))
-				sv := escapeHTML(models.SerializeValue(drift.StateValue))
-
-				sb.WriteString(fmt.Sprintf(`<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><span class="badge %s">%s</span></td></tr>`,
-					dtype, drift.AttributePath, cv, sv, riskD, drift.RiskLevel))
-			}
-
-			sb.WriteString(`</table>`)
-
-			if len(result.Remediations) > 0 {
-				for _, rem := range result.Remediations {
-					if rem.Recommended != nil {
-						desc := rem.Recommended.Description
-						cmd := rem.Recommended.Command
-						sb.WriteString(`<div class="remediation">`)
-						sb.WriteString(fmt.Sprintf(`<strong>Remediation:</strong> %s`, escapeHTML(desc)))
-						if cmd != "" && !strings.HasPrefix(cmd, "#") {
-							sb.WriteString(fmt.Sprintf(`<br><code>%s</code>`, escapeHTML(cmd)))
-						}
-						sb.WriteString(`</div>`)
-					}
+		groups := report.GroupResults(opts.GroupBy)
+		if groups != nil {
+			for _, group := range groups {
+				fmt.Fprintf(&sb, `<h2 class="group-title">📁 %s <span class="group-stats">%d resources · %d drifts</span></h2>`,
+					escapeHTML(group.GroupName), group.ResourceCnt, group.DriftCnt)
+				for _, result := range group.Results {
+					panelIndex = printResourcePanelHTML(&sb, result, panelIndex)
 				}
 			}
-
-			if len(result.ImpactedResources) > 0 {
-				sb.WriteString(`<div class="impact">`)
-				sb.WriteString(`<strong>⚡ Impact Analysis:</strong><ul>`)
-				for _, imp := range result.ImpactedResources {
-					pathStr := strings.Join(imp.PropagationPath, " → ")
-					sb.WriteString(fmt.Sprintf(`<li>L%d: <code>%s</code> (via %s)</li>`,
-						imp.Level, imp.ResourceAddr, pathStr))
-				}
-				sb.WriteString(`</ul></div>`)
+		} else {
+			for _, result := range report.Results {
+				panelIndex = printResourcePanelHTML(&sb, result, panelIndex)
 			}
-
-			sb.WriteString(`</div></div>`)
 		}
 	}
 
@@ -321,6 +302,67 @@ function togglePanel(id) {
 </html>`)
 
 	return sb.String()
+}
+
+func printResourcePanelHTML(sb *strings.Builder, result *models.DriftResult, panelIndex int) int {
+	i := panelIndex
+	riskClass := fmt.Sprintf("risk-%s", result.MaxRisk)
+	sb.WriteString(`<div class="details-panel">`)
+	sb.WriteString(fmt.Sprintf(`<div class="details-header" onclick="togglePanel('panel-%d')">`, i))
+	sb.WriteString(fmt.Sprintf(`<span class="arrow" id="arrow-%d">▶</span>`, i))
+	sb.WriteString(fmt.Sprintf(`<span class="badge %s">%s</span>`, riskClass, strings.ToUpper(string(result.MaxRisk))))
+	sb.WriteString(fmt.Sprintf(`<code>%s</code>`, result.ResourceAddr))
+	sb.WriteString(fmt.Sprintf(`<span style="color:#64748b">(%d drifts)</span>`, len(result.Drifts)))
+	sb.WriteString(`</div>`)
+
+	sb.WriteString(fmt.Sprintf(`<div class="details-content" id="panel-%d">`, i))
+
+	sb.WriteString(`<table><tr><th>Type</th><th>Attribute</th><th>Config</th><th>State</th><th>Risk</th></tr>`)
+
+	sort.Slice(result.Drifts, func(i, j int) bool {
+		return result.Drifts[i].DriftType.SeverityOrder() < result.Drifts[j].DriftType.SeverityOrder()
+	})
+
+	for _, drift := range result.Drifts {
+		dtype := driftTypeLabel[drift.DriftType]
+		riskD := fmt.Sprintf("risk-%s", drift.RiskLevel)
+		cv := escapeHTML(models.SerializeValue(drift.ConfigValue))
+		sv := escapeHTML(models.SerializeValue(drift.StateValue))
+
+		sb.WriteString(fmt.Sprintf(`<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><span class="badge %s">%s</span></td></tr>`,
+			dtype, drift.AttributePath, cv, sv, riskD, drift.RiskLevel))
+	}
+
+	sb.WriteString(`</table>`)
+
+	if len(result.Remediations) > 0 {
+		for _, rem := range result.Remediations {
+			if rem.Recommended != nil {
+				desc := rem.Recommended.Description
+				cmd := rem.Recommended.Command
+				sb.WriteString(`<div class="remediation">`)
+				sb.WriteString(fmt.Sprintf(`<strong>Remediation:</strong> %s`, escapeHTML(desc)))
+				if cmd != "" && !strings.HasPrefix(cmd, "#") {
+					sb.WriteString(fmt.Sprintf(`<br><code>%s</code>`, escapeHTML(cmd)))
+				}
+				sb.WriteString(`</div>`)
+			}
+		}
+	}
+
+	if len(result.ImpactedResources) > 0 {
+		sb.WriteString(`<div class="impact">`)
+		sb.WriteString(`<strong>⚡ Impact Analysis:</strong><ul>`)
+		for _, imp := range result.ImpactedResources {
+			pathStr := strings.Join(imp.PropagationPath, " → ")
+			sb.WriteString(fmt.Sprintf(`<li>L%d: <code>%s</code> (via %s)</li>`,
+				imp.Level, imp.ResourceAddr, pathStr))
+		}
+		sb.WriteString(`</ul></div>`)
+	}
+
+	sb.WriteString(`</div></div>`)
+	return i + 1
 }
 
 func escapeHTML(s string) string {
