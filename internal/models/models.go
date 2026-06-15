@@ -3,10 +3,41 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 )
+
+const ToolVersion = "0.1.0"
+
+type ReportMetadata struct {
+	ToolVersion  string
+	Timestamp    string
+	Command      string
+	StateFileAbs string
+	ConfigDirAbs string
+	GoVersion    string
+}
+
+func NewReportMetadata(stateFileAbs, configDirAbs string) *ReportMetadata {
+	return &ReportMetadata{
+		ToolVersion:  ToolVersion,
+		Timestamp:    time.Now().Format(time.RFC3339),
+		Command:      strings.Join(getCommandArgs(), " "),
+		StateFileAbs: stateFileAbs,
+		ConfigDirAbs: configDirAbs,
+		GoVersion:    runtime.Version(),
+	}
+}
+
+func getCommandArgs() []string {
+	if len(os.Args) > 0 {
+		return os.Args[1:]
+	}
+	return []string{}
+}
 
 type DriftType string
 
@@ -252,6 +283,7 @@ func (r *DriftResult) ComputeMaxRisk() {
 }
 
 type DriftReport struct {
+	Metadata               *ReportMetadata
 	Timestamp              string
 	StateFile              string
 	ConfigDir              string
@@ -341,6 +373,7 @@ func NewReportOptions() *ReportOptions {
 
 func (r *DriftReport) FilterByRisk(minRisk RiskLevel) *DriftReport {
 	filtered := &DriftReport{
+		Metadata:               r.Metadata,
 		Timestamp:              r.Timestamp,
 		StateFile:              r.StateFile,
 		ConfigDir:              r.ConfigDir,
@@ -355,18 +388,38 @@ func (r *DriftReport) FilterByRisk(minRisk RiskLevel) *DriftReport {
 	minOrder := minRisk.Order()
 	for _, res := range r.Results {
 		var filteredDrifts []*DriftItem
+		keptAttrs := make(map[string]bool)
 		for _, d := range res.Drifts {
 			if d.RiskLevel.Order() <= minOrder {
 				filteredDrifts = append(filteredDrifts, d)
+				keptAttrs[d.AttributePath] = true
 			}
 		}
 		if len(filteredDrifts) > 0 {
+			var filteredRems []*Remediation
+			for _, rem := range res.Remediations {
+				if rem.Attribute == "*" {
+					var hasMatchingDrift bool
+					for _, d := range filteredDrifts {
+						if d.DriftType == DriftResourceMissing || d.DriftType == DriftOrphanResource {
+							hasMatchingDrift = true
+							break
+						}
+					}
+					if hasMatchingDrift {
+						filteredRems = append(filteredRems, rem)
+					}
+				} else if keptAttrs[rem.Attribute] {
+					filteredRems = append(filteredRems, rem)
+				}
+			}
+
 			newRes := &DriftResult{
 				ResourceAddr:      res.ResourceAddr,
 				ResourceType:      res.ResourceType,
 				Drifts:            filteredDrifts,
 				ImpactedResources: res.ImpactedResources,
-				Remediations:      res.Remediations,
+				Remediations:      filteredRems,
 			}
 			newRes.ComputeMaxRisk()
 			filtered.Results = append(filtered.Results, newRes)
@@ -467,20 +520,18 @@ func (r *DriftReport) GroupResults(groupBy string) []*GroupResult {
 		return gi.GroupName < gj.GroupName
 	})
 
-	for _, grp := range groupMap {
-		sort.Slice(grp.Results, func(i, j int) bool {
-			ri := grp.Results[i].MaxRisk.Order()
-			rj := grp.Results[j].MaxRisk.Order()
-			if ri != rj {
-				return ri < rj
-			}
-			return grp.Results[i].ResourceAddr < grp.Results[j].ResourceAddr
-		})
-	}
-
 	result := make([]*GroupResult, len(groupOrder))
 	for i, key := range groupOrder {
-		result[i] = groupMap[key]
+		grp := groupMap[key]
+		sort.Slice(grp.Results, func(a, b int) bool {
+			ra := grp.Results[a].MaxRisk.Order()
+			rb := grp.Results[b].MaxRisk.Order()
+			if ra != rb {
+				return ra < rb
+			}
+			return grp.Results[a].ResourceAddr < grp.Results[b].ResourceAddr
+		})
+		result[i] = grp
 	}
 	return result
 }

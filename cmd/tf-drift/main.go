@@ -168,6 +168,10 @@ func cmdDetect(args []string) {
 
 	remediation.GenerateRemediations(report.Results, stateMap)
 
+	stateFileAbs, _ := filepath.Abs(*stateFile)
+	configDirAbs, _ := filepath.Abs(*configDir)
+	report.Metadata = models.NewReportMetadata(stateFileAbs, configDirAbs)
+
 	report.ComputeSummary()
 	report.SortResults()
 

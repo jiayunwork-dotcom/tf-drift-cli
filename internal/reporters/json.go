@@ -22,10 +22,11 @@ func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[st
 	}
 
 	base := map[string]interface{}{
-		"timestamp":   report.Timestamp,
-		"state_file":  report.StateFile,
-		"config_dir":  report.ConfigDir,
-		"workspace":   report.Workspace,
+		"metadata":        metadataToDict(report.Metadata),
+		"timestamp":       report.Timestamp,
+		"state_file":      report.StateFile,
+		"config_dir":      report.ConfigDir,
+		"workspace":       report.Workspace,
 		"options": map[string]interface{}{
 			"group_by": opts.GroupBy,
 			"min_risk": string(opts.MinRisk),
@@ -40,8 +41,8 @@ func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[st
 			"low_risk_count":            report.LowRiskCount,
 			"ignored_count":             report.IgnoredCount,
 		},
-		"results":            results,
-		"environment_diffs":  report.EnvironmentDiffs,
+		"results":           results,
+		"environment_diffs": report.EnvironmentDiffs,
 	}
 
 	groups := report.GroupResults(opts.GroupBy)
@@ -53,16 +54,30 @@ func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[st
 				groupResults[j] = resultToDict(r)
 			}
 			groupData[i] = map[string]interface{}{
-				"group_name":    g.GroupName,
-				"resource_cnt":  g.ResourceCnt,
-				"drift_cnt":     g.DriftCnt,
-				"results":       groupResults,
+				"group_name":   g.GroupName,
+				"resource_cnt": g.ResourceCnt,
+				"drift_cnt":    g.DriftCnt,
+				"results":      groupResults,
 			}
 		}
 		base["groups"] = groupData
 	}
 
 	return base
+}
+
+func metadataToDict(m *models.ReportMetadata) map[string]interface{} {
+	if m == nil {
+		return map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"tool_version":   m.ToolVersion,
+		"timestamp":      m.Timestamp,
+		"command":        m.Command,
+		"state_file_abs": m.StateFileAbs,
+		"config_dir_abs": m.ConfigDirAbs,
+		"go_version":     m.GoVersion,
+	}
 }
 
 func resultToDict(result *models.DriftResult) map[string]interface{} {
