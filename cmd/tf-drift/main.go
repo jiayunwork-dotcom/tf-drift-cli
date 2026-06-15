@@ -88,6 +88,7 @@ func cmdDetect(args []string) {
 	minRisk := fs.String("min-risk", "low", "Minimum risk level to show (low/medium/high)")
 	sortMode := fs.String("sort", "risk", "Sort mode (risk/count)")
 	policyFile := fs.String("policy", "", "Path to policy file (.tfdrift-policy.yaml)")
+	policyCache := fs.String("policy-cache", "", "Path to policy cache file (.tfdrift-policy-cache.json)")
 	fs.Parse(args)
 
 	if *stateFile == "" && *configDir == "" && *noConfig == false {
@@ -200,7 +201,40 @@ func cmdDetect(args []string) {
 			fmt.Fprintf(os.Stderr, "Policy error: %v\n", err)
 			os.Exit(4)
 		}
-		complianceResult = policy.EvaluatePolicies(report, pf.Policies)
+
+		if *policyCache != "" {
+			policySHA, err := policy.ComputePolicyFileSHA256(*policyFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to compute policy file hash: %v\n", err)
+			}
+
+			cache, err := policy.LoadPolicyCache(*policyCache)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load policy cache: %v\n", err)
+				cache = nil
+			}
+
+			useCache := true
+			if cache != nil && policySHA != "" && cache.PolicyFileSHA256 != policySHA {
+				fmt.Fprintf(os.Stderr, "策略文件已变更,缓存已失效,执行全量评估\n")
+				cache = nil
+				useCache = false
+			}
+
+			var newCache *policy.PolicyCache
+			complianceResult, newCache = policy.EvaluatePoliciesWithCache(report, pf.Policies, cache)
+
+			if policySHA != "" {
+				newCache.PolicyFileSHA256 = policySHA
+			}
+
+			if err := policy.SavePolicyCache(*policyCache, newCache); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to save policy cache: %v\n", err)
+			}
+			_ = useCache
+		} else {
+			complianceResult = policy.EvaluatePolicies(report, pf.Policies)
+		}
 	}
 
 	displayReport := report

@@ -169,6 +169,12 @@ func printResourceDriftMarkdown(sb *strings.Builder, result *models.DriftResult)
 func printComplianceMarkdown(sb *strings.Builder, compliance *policy.ComplianceResult) {
 	sb.WriteString("## Compliance\n\n")
 
+	if compliance.CacheReused > 0 || compliance.CacheReevaluated > 0 {
+		sb.WriteString("### 策略评估统计\n\n")
+		fmt.Fprintf(sb, "- **复用缓存:** %d 条\n", compliance.CacheReused)
+		fmt.Fprintf(sb, "- **重新评估:** %d 条\n\n", compliance.CacheReevaluated)
+	}
+
 	if len(compliance.ViolatedPolicies) == 0 {
 		sb.WriteString("> ✅ **All drifts comply with policies**\n\n")
 		return
@@ -200,8 +206,8 @@ func printComplianceMarkdown(sb *strings.Builder, compliance *policy.ComplianceR
 			}
 			fmt.Fprintf(sb, "#### %s `[%s]` — %s\n\n", vp.PolicyName, vp.PolicyID, actionLabel)
 
-			sb.WriteString("| Resource | Attribute | Drift Type |\n")
-			sb.WriteString("|----------|-----------|------------|\n")
+			sb.WriteString("| Resource | Attribute | Drift Type | From Cache |\n")
+			sb.WriteString("|----------|-----------|------------|------------|\n")
 
 			for _, v := range vp.Violations {
 				attr := v.AttributePath
@@ -209,8 +215,12 @@ func printComplianceMarkdown(sb *strings.Builder, compliance *policy.ComplianceR
 					attr = "_(resource-level)_"
 				}
 				driftLabel := driftTypeLabel[v.DriftType]
-				fmt.Fprintf(sb, "| `%s` | `%s` | %s |\n",
-					v.ResourceAddr, attr, driftLabel)
+				cacheTag := "❌"
+				if v.FromCache {
+					cacheTag = "✅"
+				}
+				fmt.Fprintf(sb, "| `%s` | `%s` | %s | %s |\n",
+					v.ResourceAddr, attr, driftLabel, cacheTag)
 			}
 			sb.WriteString("\n")
 		}
@@ -431,6 +441,14 @@ func printResourcePanelHTML(sb *strings.Builder, result *models.DriftResult, pan
 func printComplianceHTML(sb *strings.Builder, compliance *policy.ComplianceResult) {
 	sb.WriteString(`<h2>Compliance</h2>`)
 
+	if compliance.CacheReused > 0 || compliance.CacheReevaluated > 0 {
+		sb.WriteString(`<div style="background:#f0f9ff;border-radius:8px;padding:16px;margin-bottom:16px;">`)
+		sb.WriteString(`<strong style="color:#0369a1;">📊 策略评估统计</strong><br>`)
+		fmt.Fprintf(sb, `<span style="color:#0284c7;">复用缓存: %d 条</span> | `, compliance.CacheReused)
+		fmt.Fprintf(sb, `<span style="color:#c2410c;">重新评估: %d 条</span>`, compliance.CacheReevaluated)
+		sb.WriteString(`</div>`)
+	}
+
 	if len(compliance.ViolatedPolicies) == 0 {
 		sb.WriteString(`<div style="text-align:center;padding:20px;background:#f0fdf4;border-radius:8px;">`)
 		sb.WriteString(`<strong style="color:#16a34a;">✅ All drifts comply with policies</strong>`)
@@ -473,15 +491,19 @@ func printComplianceHTML(sb *strings.Builder, compliance *policy.ComplianceResul
 			fmt.Fprintf(sb, `</div>`)
 			fmt.Fprintf(sb, `<div class="details-content">`)
 
-			sb.WriteString(`<table><tr><th>Resource</th><th>Attribute</th><th>Drift Type</th></tr>`)
+			sb.WriteString(`<table><tr><th>Resource</th><th>Attribute</th><th>Drift Type</th><th>From Cache</th></tr>`)
 			for _, v := range vp.Violations {
 				attr := v.AttributePath
 				if attr == "" {
 					attr = "(resource-level)"
 				}
 				driftLabel := driftTypeLabel[v.DriftType]
-				fmt.Fprintf(sb, `<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>`,
-					escapeHTML(v.ResourceAddr), escapeHTML(attr), driftLabel)
+				cacheTag := `<span style="color:#dc2626;">❌</span>`
+				if v.FromCache {
+					cacheTag = `<span style="color:#16a34a;">✅</span>`
+				}
+				fmt.Fprintf(sb, `<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td style="text-align:center;">%s</td></tr>`,
+					escapeHTML(v.ResourceAddr), escapeHTML(attr), driftLabel, cacheTag)
 			}
 			sb.WriteString(`</table>`)
 

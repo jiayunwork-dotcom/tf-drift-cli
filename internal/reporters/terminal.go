@@ -236,6 +236,14 @@ func printComplianceSection(sb *strings.Builder, compliance *policy.ComplianceRe
 	fmt.Fprintf(sb, "\n%sCompliance Assessment%s\n\n", colorBold+colorMagenta, colorReset)
 	sb.WriteString(strings.Repeat("─", 60) + "\n")
 
+	if compliance.CacheReused > 0 || compliance.CacheReevaluated > 0 {
+		fmt.Fprintf(sb, "  %s策略评估: %s%d%s条复用缓存 | %s%d%s条重新评估%s\n\n",
+			colorDim,
+			colorCyan, compliance.CacheReused, colorDim,
+			colorYellow, compliance.CacheReevaluated, colorDim,
+			colorReset)
+	}
+
 	if len(compliance.ViolatedPolicies) == 0 {
 		sb.WriteString(colorGreen + colorBold + "  ✓ All drifts comply with policies" + colorReset + "\n\n")
 		return
@@ -273,11 +281,16 @@ func printComplianceSection(sb *strings.Builder, compliance *policy.ComplianceRe
 				if attr == "" {
 					attr = "(resource-level)"
 				}
-				fmt.Fprintf(sb, "      %s- %s: %s%s%s [%s]\n",
+				cacheTag := ""
+				if v.FromCache {
+					cacheTag = " " + colorBlue + "[CACHE]" + colorReset
+				}
+				fmt.Fprintf(sb, "      %s- %s: %s%s%s [%s]%s\n",
 					colorDim,
 					v.ResourceAddr,
 					sevColor, attr, colorReset,
-					driftLabel)
+					driftLabel,
+					cacheTag)
 			}
 		}
 	}

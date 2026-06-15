@@ -80,6 +80,7 @@ func complianceToDict(compliance *policy.ComplianceResult) map[string]interface{
 				"resource_address": v.ResourceAddr,
 				"attribute":        v.AttributePath,
 				"drift_type":       string(v.DriftType),
+				"from_cache":       v.FromCache,
 			}
 		}
 		violatedPolicies[i] = map[string]interface{}{
@@ -91,10 +92,19 @@ func complianceToDict(compliance *policy.ComplianceResult) map[string]interface{
 		}
 	}
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"violated_policies": violatedPolicies,
 		"has_critical":      compliance.HasCritical,
 	}
+
+	if compliance.CacheReused > 0 || compliance.CacheReevaluated > 0 {
+		result["cache_stats"] = map[string]interface{}{
+			"cache_reused":     compliance.CacheReused,
+			"cache_reevaluated": compliance.CacheReevaluated,
+		}
+	}
+
+	return result
 }
 
 func metadataToDict(m *models.ReportMetadata) map[string]interface{} {
