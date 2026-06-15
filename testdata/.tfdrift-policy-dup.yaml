@@ -1,0 +1,15 @@
+policies:
+  - id: "POL-001"
+    name: "Test Policy 1"
+    severity: "warning"
+    match:
+      drift_types:
+        - "changed"
+    action: "warn"
+  - id: "POL-001"
+    name: "Test Policy 2"
+    severity: "info"
+    match:
+      drift_types:
+        - "missing"
+    action: "warn"

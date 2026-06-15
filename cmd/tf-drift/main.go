@@ -13,6 +13,7 @@ import (
 	"github.com/tf-drift/tf-drift/internal/models"
 	multienv "github.com/tf-drift/tf-drift/internal/multi_env"
 	"github.com/tf-drift/tf-drift/internal/parsers/config"
+	"github.com/tf-drift/tf-drift/internal/policy"
 	"github.com/tf-drift/tf-drift/internal/remediation"
 	"github.com/tf-drift/tf-drift/internal/reporters"
 )
@@ -86,6 +87,7 @@ func cmdDetect(args []string) {
 	groupBy := fs.String("group-by", "none", "Group results by (none/resource_type/module)")
 	minRisk := fs.String("min-risk", "low", "Minimum risk level to show (low/medium/high)")
 	sortMode := fs.String("sort", "risk", "Sort mode (risk/count)")
+	policyFile := fs.String("policy", "", "Path to policy file (.tfdrift-policy.yaml)")
 	fs.Parse(args)
 
 	if *stateFile == "" && *configDir == "" && *noConfig == false {
@@ -191,6 +193,16 @@ func cmdDetect(args []string) {
 		opts.Sort = *sortMode
 	}
 
+	var complianceResult *policy.ComplianceResult
+	if *policyFile != "" {
+		pf, err := policy.LoadPolicyFile(*policyFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Policy error: %v\n", err)
+			os.Exit(4)
+		}
+		complianceResult = policy.EvaluatePolicies(report, pf.Policies)
+	}
+
 	displayReport := report
 	if opts.MinRisk != models.RiskLow {
 		displayReport = report.FilterByRisk(opts.MinRisk)
@@ -212,13 +224,13 @@ func cmdDetect(args []string) {
 
 	switch *format {
 	case "json":
-		content, formatErr = reporters.FormatJSON(displayReport, opts)
+		content, formatErr = reporters.FormatJSON(displayReport, opts, complianceResult)
 	case "markdown":
-		content = reporters.FormatMarkdown(displayReport, opts)
+		content = reporters.FormatMarkdown(displayReport, opts, complianceResult)
 	case "html":
-		content = reporters.FormatHTML(displayReport, opts)
+		content = reporters.FormatHTML(displayReport, opts, complianceResult)
 	default:
-		content = reporters.FormatTerminal(displayReport, opts)
+		content = reporters.FormatTerminal(displayReport, opts, complianceResult)
 	}
 
 	if formatErr != nil {
@@ -227,6 +239,10 @@ func cmdDetect(args []string) {
 	}
 
 	writeOutput(content, *output)
+
+	if complianceResult != nil && complianceResult.HasCritical {
+		os.Exit(3)
+	}
 
 	threshold := *exitCodeFlag
 	if threshold == "" {

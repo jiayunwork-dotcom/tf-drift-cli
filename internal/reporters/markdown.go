@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/tf-drift/tf-drift/internal/models"
+	"github.com/tf-drift/tf-drift/internal/policy"
 )
 
 var riskEmoji = map[models.RiskLevel]string{
@@ -23,7 +24,7 @@ var driftTypeLabel = map[models.DriftType]string{
 	models.DriftTypeMismatch:     "Type Mismatch",
 }
 
-func FormatMarkdown(report *models.DriftReport, opts *models.ReportOptions) string {
+func FormatMarkdown(report *models.DriftReport, opts *models.ReportOptions, compliance *policy.ComplianceResult) string {
 	var sb strings.Builder
 
 	sb.WriteString("# Terraform Drift Detection Report\n\n")
@@ -51,6 +52,9 @@ func FormatMarkdown(report *models.DriftReport, opts *models.ReportOptions) stri
 
 	if len(report.Results) == 0 {
 		sb.WriteString("> ✅ **No drift detected!**\n\n")
+		if compliance != nil {
+			printComplianceMarkdown(&sb, compliance)
+		}
 		return sb.String()
 	}
 
@@ -96,6 +100,10 @@ func FormatMarkdown(report *models.DriftReport, opts *models.ReportOptions) stri
 			sb.WriteString(line + "\n")
 		}
 		sb.WriteString("\n")
+	}
+
+	if compliance != nil {
+		printComplianceMarkdown(&sb, compliance)
 	}
 
 	return sb.String()
@@ -158,6 +166,57 @@ func printResourceDriftMarkdown(sb *strings.Builder, result *models.DriftResult)
 	}
 }
 
+func printComplianceMarkdown(sb *strings.Builder, compliance *policy.ComplianceResult) {
+	sb.WriteString("## Compliance\n\n")
+
+	if len(compliance.ViolatedPolicies) == 0 {
+		sb.WriteString("> ✅ **All drifts comply with policies**\n\n")
+		return
+	}
+
+	grouped := policy.GroupBySeverity(compliance.ViolatedPolicies)
+
+	severityEmoji := map[policy.Severity]string{
+		policy.SeverityCritical: "🔴",
+		policy.SeverityWarning:  "🟡",
+		policy.SeverityInfo:     "🔵",
+	}
+
+	severities := []policy.Severity{policy.SeverityCritical, policy.SeverityWarning, policy.SeverityInfo}
+	for _, sev := range severities {
+		policies, ok := grouped[sev]
+		if !ok {
+			continue
+		}
+
+		emoji := severityEmoji[sev]
+		sevLabel := strings.ToUpper(string(sev))
+		fmt.Fprintf(sb, "### %s %s Policies Violated (%d)\n\n", emoji, sevLabel, len(policies))
+
+		for _, vp := range policies {
+			actionLabel := "WARN"
+			if vp.Action == policy.ActionBlock {
+				actionLabel = "BLOCK"
+			}
+			fmt.Fprintf(sb, "#### %s `[%s]` — %s\n\n", vp.PolicyName, vp.PolicyID, actionLabel)
+
+			sb.WriteString("| Resource | Attribute | Drift Type |\n")
+			sb.WriteString("|----------|-----------|------------|\n")
+
+			for _, v := range vp.Violations {
+				attr := v.AttributePath
+				if attr == "" {
+					attr = "_(resource-level)_"
+				}
+				driftLabel := driftTypeLabel[v.DriftType]
+				fmt.Fprintf(sb, "| `%s` | `%s` | %s |\n",
+					v.ResourceAddr, attr, driftLabel)
+			}
+			sb.WriteString("\n")
+		}
+	}
+}
+
 func fmtValueMD(v interface{}) string {
 	s := models.SerializeValue(v)
 	s = strings.ReplaceAll(s, "|", "\\|")
@@ -167,7 +226,7 @@ func fmtValueMD(v interface{}) string {
 	return s
 }
 
-func FormatHTML(report *models.DriftReport, opts *models.ReportOptions) string {
+func FormatHTML(report *models.DriftReport, opts *models.ReportOptions, compliance *policy.ComplianceResult) string {
 	var sb strings.Builder
 
 	sb.WriteString(`<!DOCTYPE html>
@@ -288,6 +347,10 @@ code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 13p
 		}
 	}
 
+	if compliance != nil {
+		printComplianceHTML(&sb, compliance)
+	}
+
 	sb.WriteString(`
 <script>
 function togglePanel(id) {
@@ -363,6 +426,68 @@ func printResourcePanelHTML(sb *strings.Builder, result *models.DriftResult, pan
 
 	sb.WriteString(`</div></div>`)
 	return i + 1
+}
+
+func printComplianceHTML(sb *strings.Builder, compliance *policy.ComplianceResult) {
+	sb.WriteString(`<h2>Compliance</h2>`)
+
+	if len(compliance.ViolatedPolicies) == 0 {
+		sb.WriteString(`<div style="text-align:center;padding:20px;background:#f0fdf4;border-radius:8px;">`)
+		sb.WriteString(`<strong style="color:#16a34a;">✅ All drifts comply with policies</strong>`)
+		sb.WriteString(`</div>`)
+		return
+	}
+
+	grouped := policy.GroupBySeverity(compliance.ViolatedPolicies)
+
+	severityStyles := map[policy.Severity]string{
+		policy.SeverityCritical: "background:#dc2626;color:white;",
+		policy.SeverityWarning:  "background:#d97706;color:white;",
+		policy.SeverityInfo:     "background:#0891b2;color:white;",
+	}
+
+	severities := []policy.Severity{policy.SeverityCritical, policy.SeverityWarning, policy.SeverityInfo}
+	for _, sev := range severities {
+		policies, ok := grouped[sev]
+		if !ok {
+			continue
+		}
+
+		style := severityStyles[sev]
+		sevLabel := strings.ToUpper(string(sev))
+		fmt.Fprintf(sb, `<h3 style="%spadding:8px 16px;border-radius:6px;">%s Policies Violated (%d)</h3>`,
+			style, sevLabel, len(policies))
+
+		for _, vp := range policies {
+			actionLabel := "WARN"
+			actionStyle := "background:#fef3c7;color:#92400e;"
+			if vp.Action == policy.ActionBlock {
+				actionLabel = "BLOCK"
+				actionStyle = "background:#fee2e2;color:#991b1b;"
+			}
+
+			fmt.Fprintf(sb, `<div class="details-panel">`)
+			fmt.Fprintf(sb, `<div class="details-header">`)
+			fmt.Fprintf(sb, `<strong>%s</strong> <code style="font-size:12px;">[%s]</code> <span class="badge" style="%s">%s</span>`,
+				vp.PolicyName, vp.PolicyID, actionStyle, actionLabel)
+			fmt.Fprintf(sb, `</div>`)
+			fmt.Fprintf(sb, `<div class="details-content">`)
+
+			sb.WriteString(`<table><tr><th>Resource</th><th>Attribute</th><th>Drift Type</th></tr>`)
+			for _, v := range vp.Violations {
+				attr := v.AttributePath
+				if attr == "" {
+					attr = "(resource-level)"
+				}
+				driftLabel := driftTypeLabel[v.DriftType]
+				fmt.Fprintf(sb, `<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>`,
+					escapeHTML(v.ResourceAddr), escapeHTML(attr), driftLabel)
+			}
+			sb.WriteString(`</table>`)
+
+			fmt.Fprintf(sb, `</div></div>`)
+		}
+	}
 }
 
 func escapeHTML(s string) string {

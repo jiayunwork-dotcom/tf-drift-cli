@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/tf-drift/tf-drift/internal/models"
+	"github.com/tf-drift/tf-drift/internal/policy"
 )
 
 const (
@@ -44,7 +45,7 @@ var driftTypeColors = map[models.DriftType]string{
 	models.DriftTypeMismatch:     colorYellow,
 }
 
-func FormatTerminal(report *models.DriftReport, opts *models.ReportOptions) string {
+func FormatTerminal(report *models.DriftReport, opts *models.ReportOptions, compliance *policy.ComplianceResult) string {
 	var sb strings.Builder
 
 	printHeader(&sb, report)
@@ -52,6 +53,9 @@ func FormatTerminal(report *models.DriftReport, opts *models.ReportOptions) stri
 
 	if len(report.Results) == 0 {
 		sb.WriteString("\n" + colorGreen + colorBold + "✓ No drift detected!" + colorReset + "\n\n")
+		if compliance != nil {
+			printComplianceSection(&sb, compliance)
+		}
 		return sb.String()
 	}
 
@@ -74,6 +78,10 @@ func FormatTerminal(report *models.DriftReport, opts *models.ReportOptions) stri
 
 	if len(report.EnvironmentDiffs) > 0 {
 		printEnvDiffs(&sb, report.EnvironmentDiffs)
+	}
+
+	if compliance != nil {
+		printComplianceSection(&sb, compliance)
 	}
 
 	return sb.String()
@@ -222,6 +230,59 @@ func printEnvDiffs(sb *strings.Builder, diffs []map[string]interface{}) {
 
 		sb.WriteString(line + "\n")
 	}
+}
+
+func printComplianceSection(sb *strings.Builder, compliance *policy.ComplianceResult) {
+	fmt.Fprintf(sb, "\n%sCompliance Assessment%s\n\n", colorBold+colorMagenta, colorReset)
+	sb.WriteString(strings.Repeat("─", 60) + "\n")
+
+	if len(compliance.ViolatedPolicies) == 0 {
+		sb.WriteString(colorGreen + colorBold + "  ✓ All drifts comply with policies" + colorReset + "\n\n")
+		return
+	}
+
+	grouped := policy.GroupBySeverity(compliance.ViolatedPolicies)
+
+	severities := []policy.Severity{policy.SeverityCritical, policy.SeverityWarning, policy.SeverityInfo}
+	for _, sev := range severities {
+		policies, ok := grouped[sev]
+		if !ok {
+			continue
+		}
+
+		sevColor := policy.SeverityColor(sev)
+		sevLabel := policy.SeverityLabel(sev)
+		fmt.Fprintf(sb, "\n  %s%s%s policies violated %s(%d)%s\n\n",
+			sevColor+colorBold, sevLabel, colorReset,
+			colorDim, len(policies), colorReset)
+
+		for _, vp := range policies {
+			actionLabel := "WARN"
+			if vp.Action == policy.ActionBlock {
+				actionLabel = "BLOCK"
+			}
+			fmt.Fprintf(sb, "    %s●%s %s%s%s [%s] %s(%s)%s\n",
+				sevColor, colorReset,
+				colorBold, vp.PolicyName, colorReset,
+				vp.PolicyID,
+				colorDim, actionLabel, colorReset)
+
+			for _, v := range vp.Violations {
+				driftLabel := v.DriftType.Label()
+				attr := v.AttributePath
+				if attr == "" {
+					attr = "(resource-level)"
+				}
+				fmt.Fprintf(sb, "      %s- %s: %s%s%s [%s]\n",
+					colorDim,
+					v.ResourceAddr,
+					sevColor, attr, colorReset,
+					driftLabel)
+			}
+		}
+	}
+
+	sb.WriteString("\n")
 }
 
 func fmtValue(v interface{}) string {

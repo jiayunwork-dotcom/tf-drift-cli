@@ -1,0 +1,34 @@
+policies:
+  - id: "POL-001"
+    name: "生产环境安全组变更"
+    severity: "critical"
+    match:
+      resource_types:
+        - "aws_security_group*"
+      drift_types:
+        - "changed"
+    action: "block"
+
+  - id: "POL-002"
+    name: "缺失资源检测"
+    severity: "warning"
+    match:
+      drift_types:
+        - "missing"
+    action: "warn"
+
+  - id: "POL-003"
+    name: "额外属性检查"
+    severity: "info"
+    match:
+      drift_types:
+        - "extra"
+    action: "warn"
+
+  - id: "POL-004"
+    name: "孤立资源告警"
+    severity: "warning"
+    match:
+      drift_types:
+        - "orphan"
+    action: "block"

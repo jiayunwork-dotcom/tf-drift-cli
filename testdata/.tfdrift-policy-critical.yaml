@@ -1,0 +1,18 @@
+policies:
+  - id: "POL-001"
+    name: "EC2实例类型变更"
+    severity: "critical"
+    match:
+      resource_types:
+        - "aws_instance"
+      drift_types:
+        - "changed"
+    action: "block"
+
+  - id: "POL-002"
+    name: "缺失资源检测"
+    severity: "warning"
+    match:
+      drift_types:
+        - "missing"
+    action: "warn"

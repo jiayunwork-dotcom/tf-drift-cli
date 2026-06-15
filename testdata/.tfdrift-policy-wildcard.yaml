@@ -1,0 +1,10 @@
+policies:
+  - id: "POL-WILDCARD"
+    name: "所有标签变更"
+    severity: "warning"
+    match:
+      attributes:
+        - "tags*"
+      drift_types:
+        - "changed"
+    action: "warn"

@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 
 	"github.com/tf-drift/tf-drift/internal/models"
+	"github.com/tf-drift/tf-drift/internal/policy"
 )
 
-func FormatJSON(report *models.DriftReport, opts *models.ReportOptions) (string, error) {
-	data := reportToDict(report, opts)
+func FormatJSON(report *models.DriftReport, opts *models.ReportOptions, compliance *policy.ComplianceResult) (string, error) {
+	data := reportToDict(report, opts, compliance)
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return "", err
@@ -15,7 +16,7 @@ func FormatJSON(report *models.DriftReport, opts *models.ReportOptions) (string,
 	return string(b), nil
 }
 
-func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[string]interface{} {
+func reportToDict(report *models.DriftReport, opts *models.ReportOptions, compliance *policy.ComplianceResult) map[string]interface{} {
 	results := make([]map[string]interface{}, len(report.Results))
 	for i, r := range report.Results {
 		results[i] = resultToDict(r)
@@ -45,6 +46,10 @@ func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[st
 		"environment_diffs": report.EnvironmentDiffs,
 	}
 
+	if compliance != nil {
+		base["compliance"] = complianceToDict(compliance)
+	}
+
 	groups := report.GroupResults(opts.GroupBy)
 	if groups != nil {
 		groupData := make([]map[string]interface{}, len(groups))
@@ -64,6 +69,32 @@ func reportToDict(report *models.DriftReport, opts *models.ReportOptions) map[st
 	}
 
 	return base
+}
+
+func complianceToDict(compliance *policy.ComplianceResult) map[string]interface{} {
+	violatedPolicies := make([]map[string]interface{}, len(compliance.ViolatedPolicies))
+	for i, vp := range compliance.ViolatedPolicies {
+		violations := make([]map[string]interface{}, len(vp.Violations))
+		for j, v := range vp.Violations {
+			violations[j] = map[string]interface{}{
+				"resource_address": v.ResourceAddr,
+				"attribute":        v.AttributePath,
+				"drift_type":       string(v.DriftType),
+			}
+		}
+		violatedPolicies[i] = map[string]interface{}{
+			"policy_id":   vp.PolicyID,
+			"policy_name": vp.PolicyName,
+			"severity":    string(vp.Severity),
+			"action":      string(vp.Action),
+			"violations":  violations,
+		}
+	}
+
+	return map[string]interface{}{
+		"violated_policies": violatedPolicies,
+		"has_critical":      compliance.HasCritical,
+	}
 }
 
 func metadataToDict(m *models.ReportMetadata) map[string]interface{} {

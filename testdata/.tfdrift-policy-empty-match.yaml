@@ -1,0 +1,6 @@
+policies:
+  - id: "POL-001"
+    name: "Test Policy"
+    severity: "warning"
+    match:
+    action: "warn"
