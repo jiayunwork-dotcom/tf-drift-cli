@@ -94,6 +94,8 @@ func cmdDetect(args []string) {
 	concurrency := fs.Int("concurrency", 4, "Max concurrency per layer during remediation (default: 4)")
 	noRollback := fs.Bool("no-rollback", false, "Skip rollback phase on remediation failure")
 	resume := fs.Bool("resume", false, "Resume from existing remediation state file")
+	actionTimeout := fs.Int("action-timeout", 0, "Global default timeout in seconds for each remediation action (default: 300)")
+	remediateConfig := fs.String("remediate-config", "", "Path to remediation config file (.tfdrift-remediate.yaml)")
 	fs.Parse(args)
 
 	if *stateFile == "" && *configDir == "" && *noConfig == false {
@@ -177,10 +179,32 @@ func cmdDetect(args []string) {
 	remediation.GenerateRemediations(report.Results, stateMap)
 
 	if *remediate || *dryRun {
+		var remCfg *remediation.RemediateConfig
+		if *remediateConfig != "" {
+			cfg, err := remediation.LoadRemediateConfig(*remediateConfig)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading remediate config: %v\n", err)
+				os.Exit(1)
+			}
+			remCfg = cfg
+		} else {
+			cfgPath := remediation.FindRemediateConfig(*configDir)
+			if cfgPath != "" {
+				cfg, err := remediation.LoadRemediateConfig(cfgPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to load remediate config: %v\n", err)
+				} else {
+					remCfg = cfg
+				}
+			}
+		}
+
 		orchestrator := remediation.NewOrchestrator(report, depGraph,
 			remediation.WithConcurrency(*concurrency),
 			remediation.WithNoRollback(*noRollback),
 			remediation.WithDryRun(*dryRun),
+			remediation.WithGlobalTimeout(*actionTimeout),
+			remediation.WithRemediateConfig(remCfg),
 		)
 
 		if cycleNodes, hasCycle := orchestrator.DetectCycle(); hasCycle {

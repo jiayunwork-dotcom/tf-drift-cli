@@ -239,11 +239,14 @@ type ImpactNode struct {
 }
 
 type RemediationOption struct {
-	Action      string
-	Description string
-	Command     string
-	Risk        string
-	Note        string
+	Action        string
+	Description   string
+	Command       string
+	Risk          string
+	Note          string
+	Condition     string `json:"condition,omitempty"`
+	Timeout       int    `json:"timeout,omitempty"`
+	PostCondition string `json:"post_condition,omitempty"`
 }
 
 type Remediation struct {

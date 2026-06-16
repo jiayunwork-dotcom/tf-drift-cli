@@ -31,22 +31,30 @@ const (
 	StatusSuccess    ActionStatus = "success"
 	StatusFailed     ActionStatus = "failed"
 	StatusRolledBack ActionStatus = "rolled_back"
+	StatusSkipped    ActionStatus = "skipped"
 )
 
+const DefaultActionTimeout = 300
+const PostConditionTimeout = 60
+
 type RemediationAction struct {
-	ID             string       `json:"id"`
-	ResourceAddr   string       `json:"resource_addr"`
-	ActionType     ActionType   `json:"action_type"`
-	Command        string       `json:"command"`
-	RollbackCmd    string       `json:"rollback_command"`
-	DependsOn      []string     `json:"depends_on"`
-	Status         ActionStatus `json:"status"`
-	StartedAt      string       `json:"started_at,omitempty"`
-	FinishedAt     string       `json:"finished_at,omitempty"`
-	DurationMs     int64        `json:"duration_ms,omitempty"`
-	Error          string       `json:"error,omitempty"`
-	RiskLevel      string       `json:"risk_level"`
-	DriftType      string       `json:"drift_type"`
+	ID              string       `json:"id"`
+	ResourceAddr    string       `json:"resource_addr"`
+	ActionType      ActionType   `json:"action_type"`
+	Command         string       `json:"command"`
+	RollbackCmd     string       `json:"rollback_command"`
+	DependsOn       []string     `json:"depends_on"`
+	Status          ActionStatus `json:"status"`
+	StartedAt       string       `json:"started_at,omitempty"`
+	FinishedAt      string       `json:"finished_at,omitempty"`
+	DurationMs      int64        `json:"duration_ms,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	RiskLevel       string       `json:"risk_level"`
+	DriftType       string       `json:"drift_type"`
+	Condition       string       `json:"condition"`
+	Timeout         int          `json:"timeout"`
+	PostCondition   string       `json:"post_condition"`
+	PostConditionErr string      `json:"post_condition_error,omitempty"`
 }
 
 type ActionLayer struct {
@@ -71,16 +79,18 @@ type RemediateState struct {
 }
 
 type Orchestrator struct {
-	actions     []*RemediationAction
-	actionMap   map[string]*RemediationAction
-	plan        *ExecutionPlan
-	depGraph    *models.DependencyGraph
-	stateFile   string
-	concurrency int
-	noRollback  bool
-	dryRun      bool
-	mu          sync.Mutex
-	writeMu     sync.Mutex
+	actions        []*RemediationAction
+	actionMap      map[string]*RemediationAction
+	plan           *ExecutionPlan
+	depGraph       *models.DependencyGraph
+	stateFile      string
+	concurrency    int
+	noRollback     bool
+	dryRun         bool
+	globalTimeout  int
+	remediateCfg   *RemediateConfig
+	mu             sync.Mutex
+	writeMu        sync.Mutex
 }
 
 func computeActionID(resourceAddr, driftType, attributePath string) string {
@@ -171,6 +181,20 @@ func WithStateFile(path string) OrchestratorOption {
 	}
 }
 
+func WithGlobalTimeout(timeout int) OrchestratorOption {
+	return func(o *Orchestrator) {
+		if timeout > 0 {
+			o.globalTimeout = timeout
+		}
+	}
+}
+
+func WithRemediateConfig(cfg *RemediateConfig) OrchestratorOption {
+	return func(o *Orchestrator) {
+		o.remediateCfg = cfg
+	}
+}
+
 func (o *Orchestrator) buildActions(report *models.DriftReport) {
 	resourceActions := make(map[string]*RemediationAction)
 
@@ -209,6 +233,23 @@ func (o *Orchestrator) buildActions(report *models.DriftReport) {
 			DriftType:    string(primaryDrift.DriftType),
 		}
 
+		for _, rem := range result.Remediations {
+			if rem.Recommended != nil {
+				if rem.Recommended.Condition != "" && action.Condition == "" {
+					action.Condition = rem.Recommended.Condition
+				}
+				if rem.Recommended.Timeout > 0 && action.Timeout == 0 {
+					action.Timeout = rem.Recommended.Timeout
+				}
+				if rem.Recommended.PostCondition != "" && action.PostCondition == "" {
+					action.PostCondition = rem.Recommended.PostCondition
+				}
+				break
+			}
+		}
+
+		o.applyActionConfig(action)
+
 		o.actions = append(o.actions, action)
 		o.actionMap[id] = action
 		resourceActions[resourceAddr] = action
@@ -222,6 +263,23 @@ func (o *Orchestrator) buildActions(report *models.DriftReport) {
 					action.DependsOn = append(action.DependsOn, depAction.ID)
 				}
 			}
+		}
+	}
+}
+
+func (o *Orchestrator) applyActionConfig(action *RemediationAction) {
+	if o.remediateCfg != nil {
+		o.remediateCfg.ApplyToAction(action, o.globalTimeout)
+	} else {
+		if action.Timeout == 0 {
+			if o.globalTimeout > 0 {
+				action.Timeout = o.globalTimeout
+			} else {
+				action.Timeout = DefaultActionTimeout
+			}
+		}
+		if action.PostCondition == "" && action.ActionType == ActionApply {
+			action.PostCondition = fmt.Sprintf("terraform plan -detailed-exitcode -target=%s", action.ResourceAddr)
 		}
 	}
 }
@@ -339,6 +397,70 @@ func (o *Orchestrator) computeCriticalPath(layers []*ActionLayer) []string {
 	return path
 }
 
+func (o *Orchestrator) ComputeRuntimeCriticalPath() []string {
+	if len(o.actions) == 0 {
+		return nil
+	}
+
+	longestDist := make(map[string]int)
+	pred := make(map[string]string)
+
+	for _, action := range o.actions {
+		if action.Status == StatusSkipped || action.Status == StatusSuccess || action.Status == StatusRolledBack {
+			longestDist[action.ID] = 0
+		} else {
+			longestDist[action.ID] = 0
+		}
+	}
+
+	for _, layer := range o.plan.Layers {
+		for _, action := range layer.Actions {
+			if action.Status == StatusSkipped {
+				continue
+			}
+			for _, depID := range action.DependsOn {
+				depAction := o.actionMap[depID]
+				if depAction == nil {
+					continue
+				}
+				weight := 1
+				if depAction.Status == StatusSkipped {
+					weight = 0
+				}
+				if longestDist[depID]+weight > longestDist[action.ID] {
+					longestDist[action.ID] = longestDist[depID] + weight
+					pred[action.ID] = depID
+				}
+			}
+		}
+	}
+
+	var endNode string
+	maxDist := -1
+	for id, dist := range longestDist {
+		action := o.actionMap[id]
+		if action.Status == StatusSkipped {
+			continue
+		}
+		if dist > maxDist {
+			maxDist = dist
+			endNode = id
+		}
+	}
+
+	var path []string
+	current := endNode
+	for current != "" {
+		action := o.actionMap[current]
+		if action.Status != StatusSkipped {
+			path = append([]string{action.ResourceAddr}, path...)
+		}
+		current = pred[current]
+	}
+
+	return path
+}
+
 func (o *Orchestrator) DetectCycle() ([]string, bool) {
 	white, gray, black := 0, 1, 2
 	color := make(map[string]int)
@@ -398,13 +520,16 @@ func (o *Orchestrator) FormatPlanJSON() map[string]interface{} {
 		actions := make([]map[string]interface{}, len(layer.Actions))
 		for j, action := range layer.Actions {
 			actions[j] = map[string]interface{}{
-				"id":            action.ID,
-				"resource_addr": action.ResourceAddr,
-				"action_type":   string(action.ActionType),
-				"command":       action.Command,
-				"depends_on":    action.DependsOn,
-				"risk_level":    action.RiskLevel,
-				"drift_type":    action.DriftType,
+				"id":              action.ID,
+				"resource_addr":   action.ResourceAddr,
+				"action_type":     string(action.ActionType),
+				"command":         action.Command,
+				"depends_on":      action.DependsOn,
+				"risk_level":      action.RiskLevel,
+				"drift_type":      action.DriftType,
+				"condition":       action.Condition,
+				"timeout":         action.Timeout,
+				"post_condition":  action.PostCondition,
 			}
 		}
 		layers[i] = map[string]interface{}{
@@ -463,6 +588,15 @@ func (o *Orchestrator) FormatPlanTerminal() string {
 				sb.WriteString(fmt.Sprintf("    │  Depends: %s\n", strings.Join(depAddrs, ", ")))
 			}
 			sb.WriteString(fmt.Sprintf("    │  Risk:    %s\n", action.RiskLevel))
+			if action.Condition != "" {
+				sb.WriteString(fmt.Sprintf("    │  Condition: %s\n", action.Condition))
+			}
+			if action.Timeout != DefaultActionTimeout {
+				sb.WriteString(fmt.Sprintf("    │  Timeout:   %ds\n", action.Timeout))
+			}
+			if action.PostCondition != "" {
+				sb.WriteString(fmt.Sprintf("    │  Post-Cond: %s\n", action.PostCondition))
+			}
 			sb.WriteString("    └─\n")
 		}
 		sb.WriteString("\n")
@@ -574,7 +708,7 @@ func (o *Orchestrator) ResumeFromState(state *RemediateState) {
 }
 
 func isActionFinished(status ActionStatus) bool {
-	return status == StatusSuccess || status == StatusRolledBack || status == StatusFailed
+	return status == StatusSuccess || status == StatusRolledBack || status == StatusFailed || status == StatusSkipped
 }
 
 func (o *Orchestrator) Execute() error {
@@ -586,28 +720,29 @@ func (o *Orchestrator) Execute() error {
 
 	var failedActions []*RemediationAction
 	var completedSuccess []*RemediationAction
+	var skippedActions []*RemediationAction
 	rollbackLayers := make([][]*RemediationAction, 0, len(o.plan.Layers))
 	hitFailure := false
 
 	for layerIdx, layer := range o.plan.Layers {
 		var toExecute []*RemediationAction
-		var skipped []*RemediationAction
+		var alreadyDone []*RemediationAction
 
 		o.mu.Lock()
 		for _, a := range layer.Actions {
 			if isActionFinished(a.Status) {
-				skipped = append(skipped, a)
+				alreadyDone = append(alreadyDone, a)
 			} else {
 				toExecute = append(toExecute, a)
 			}
 		}
 		o.mu.Unlock()
 
-		if len(skipped) > 0 {
-			fmt.Printf("\n\033[1m[Layer %d/%d]\033[0m Skipping %d already completed action(s)\n",
-				layerIdx+1, o.plan.TotalLayers, len(skipped))
-			for _, a := range skipped {
-				fmt.Printf("  \033[2m  ⊘ %s [%s] already %s\033[0m\n",
+		if len(alreadyDone) > 0 {
+			fmt.Printf("\n\033[1m[Layer %d/%d]\033[0m Skipping %d already processed action(s)\n",
+				layerIdx+1, o.plan.TotalLayers, len(alreadyDone))
+			for _, a := range alreadyDone {
+				fmt.Printf("  \033[2m  ⊘ %s [%s] %s\033[0m\n",
 					a.ResourceAddr, a.ActionType, a.Status)
 			}
 		}
@@ -619,6 +754,7 @@ func (o *Orchestrator) Execute() error {
 
 		var layerSuccess []*RemediationAction
 		var layerFailed []*RemediationAction
+		var layerSkipped []*RemediationAction
 
 		if len(toExecute) > 0 {
 			subLayer := &ActionLayer{Level: layer.Level, Actions: toExecute}
@@ -631,6 +767,9 @@ func (o *Orchestrator) Execute() error {
 				} else if r.Status == StatusFailed {
 					layerFailed = append(layerFailed, r)
 					failedActions = append(failedActions, r)
+				} else if r.Status == StatusSkipped {
+					layerSkipped = append(layerSkipped, r)
+					skippedActions = append(skippedActions, r)
 				}
 			}
 		} else {
@@ -642,6 +781,9 @@ func (o *Orchestrator) Execute() error {
 				} else if a.Status == StatusFailed {
 					layerFailed = append(layerFailed, a)
 					failedActions = append(failedActions, a)
+				} else if a.Status == StatusSkipped {
+					layerSkipped = append(layerSkipped, a)
+					skippedActions = append(skippedActions, a)
 				}
 			}
 			o.mu.Unlock()
@@ -659,6 +801,10 @@ func (o *Orchestrator) Execute() error {
 	if hitFailure && !o.noRollback && len(completedSuccess) > 0 {
 		fmt.Printf("\n\033[33m\033[1m⚠ Entering rollback phase (%d actions to roll back)\033[0m\n", len(completedSuccess))
 		o.executeRollbackByLayer(rollbackLayers)
+	}
+
+	if len(skippedActions) > 0 {
+		fmt.Printf("\n\033[2m  %d action(s) skipped due to conditions\033[0m\n", len(skippedActions))
 	}
 
 	if len(failedActions) > 0 {
@@ -691,6 +837,38 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 				results[idx] = a
 				return
 			}
+
+			resourceType := extractResourceType(a.ResourceAddr)
+			condVars := ConditionVars{
+				RiskLevel:    a.RiskLevel,
+				DriftType:    a.DriftType,
+				ActionType:   string(a.ActionType),
+				ResourceType: resourceType,
+			}
+
+			if a.Condition != "" {
+				condResult, condErr := EvaluateCondition(a.Condition, condVars)
+				if condErr != nil {
+					a.Status = StatusFailed
+					a.Error = fmt.Sprintf("condition evaluation error: %s", condErr.Error())
+					a.FinishedAt = time.Now().Format(time.RFC3339)
+					o.mu.Unlock()
+					o.saveState()
+					results[idx] = a
+					return
+				}
+				if !condResult {
+					a.Status = StatusSkipped
+					a.FinishedAt = time.Now().Format(time.RFC3339)
+					fmt.Printf("  \033[2m  ⊘ %s [%s] skipped (condition not met)\033[0m\n",
+						a.ResourceAddr, a.ActionType)
+					o.mu.Unlock()
+					o.saveState()
+					results[idx] = a
+					return
+				}
+			}
+
 			a.Status = StatusRunning
 			a.StartedAt = time.Now().Format(time.RFC3339)
 			o.mu.Unlock()
@@ -703,21 +881,37 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 				layer.Level+1, o.plan.TotalLayers, a.ResourceAddr, string(a.ActionType))
 
 			start := time.Now()
-			err := o.runCommand(a.Command)
+			err := o.runCommand(a.Command, a.Timeout)
 			elapsed := time.Since(start)
 
 			o.mu.Lock()
 			a.FinishedAt = time.Now().Format(time.RFC3339)
 			a.DurationMs = elapsed.Milliseconds()
+
 			if err != nil {
 				a.Status = StatusFailed
 				a.Error = err.Error()
 				fmt.Printf("  \033[31m  ✗ %s [%s] failed (%dms): %s\033[0m\n",
 					a.ResourceAddr, a.ActionType, a.DurationMs, err.Error())
 			} else {
-				a.Status = StatusSuccess
-				fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
-					a.ResourceAddr, a.ActionType, a.DurationMs)
+				if a.PostCondition != "" {
+					postErr := o.runCommand(a.PostCondition, PostConditionTimeout)
+					if postErr != nil {
+						a.Status = StatusFailed
+						a.Error = fmt.Sprintf("post-condition failed: %s", postErr.Error())
+						a.PostConditionErr = postErr.Error()
+						fmt.Printf("  \033[31m  ✗ %s [%s] post-condition failed (%dms): %s\033[0m\n",
+							a.ResourceAddr, a.ActionType, a.DurationMs, postErr.Error())
+					} else {
+						a.Status = StatusSuccess
+						fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
+							a.ResourceAddr, a.ActionType, a.DurationMs)
+					}
+				} else {
+					a.Status = StatusSuccess
+					fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
+						a.ResourceAddr, a.ActionType, a.DurationMs)
+				}
 			}
 			o.mu.Unlock()
 
@@ -732,7 +926,7 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 	return results
 }
 
-func (o *Orchestrator) runCommand(cmdStr string) error {
+func (o *Orchestrator) runCommand(cmdStr string, timeoutSec int) error {
 	if strings.HasPrefix(cmdStr, "#") || strings.HasPrefix(cmdStr, "<") {
 		return nil
 	}
@@ -743,11 +937,29 @@ func (o *Orchestrator) runCommand(cmdStr string) error {
 	}
 
 	cmd := exec.Command(parts[0], parts[1:]...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", err, string(output))
+
+	done := make(chan error, 1)
+	var output []byte
+	var cmdErr error
+
+	go func() {
+		output, cmdErr = cmd.CombinedOutput()
+		done <- cmdErr
+	}()
+
+	timeout := time.Duration(timeoutSec) * time.Second
+	select {
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return fmt.Errorf("timeout exceeded after %d seconds", timeoutSec)
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%s: %s", err, string(output))
+		}
+		return nil
 	}
-	return nil
 }
 
 func (o *Orchestrator) executeRollbackByLayer(rollbackLayers [][]*RemediationAction) {
@@ -763,6 +975,12 @@ func (o *Orchestrator) executeRollbackByLayer(rollbackLayers [][]*RemediationAct
 			status := action.Status
 			o.mu.Unlock()
 
+			if status == StatusSkipped {
+				fmt.Printf("    \033[2m  ⊘ %s [%s] skipped, no rollback needed\033[0m\n",
+					action.ResourceAddr, action.ActionType)
+				continue
+			}
+
 			if status == StatusRolledBack || status == StatusFailed {
 				fmt.Printf("    \033[2m  ⊘ %s [%s] already %s, skipping\033[0m\n",
 					action.ResourceAddr, action.ActionType, status)
@@ -777,7 +995,7 @@ func (o *Orchestrator) executeRollbackByLayer(rollbackLayers [][]*RemediationAct
 
 			fmt.Printf("    \033[33m  ↩ Rolling back: %s [%s]\033[0m\n",
 				action.ResourceAddr, action.ActionType)
-			err := o.runCommand(action.RollbackCmd)
+			err := o.runCommand(action.RollbackCmd, DefaultActionTimeout)
 
 			o.mu.Lock()
 			if err != nil {

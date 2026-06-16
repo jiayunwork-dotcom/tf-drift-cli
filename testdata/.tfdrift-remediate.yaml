@@ -1,0 +1,15 @@
+default_timeout: 600
+
+rules:
+  - match: "aws_s3_bucket"
+    condition: "risk_level == high"
+    timeout: 120
+    post_condition: "echo 'post check for s3 bucket'"
+
+  - match: "aws_instance.*"
+    condition: "drift_type != orphan_resource"
+    timeout: 300
+
+  - match: "module.*.aws_rds_cluster.default"
+    condition: "action_type == apply"
+    post_condition: "terraform plan -detailed-exitcode -target=MODULE_ADDR"
