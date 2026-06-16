@@ -1,6 +1,7 @@
 package remediation
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -884,6 +885,11 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 			err := o.runCommand(a.Command, a.Timeout)
 			elapsed := time.Since(start)
 
+			var postErr error
+			if err == nil && a.PostCondition != "" {
+				postErr = o.runCommand(a.PostCondition, PostConditionTimeout)
+			}
+
 			o.mu.Lock()
 			a.FinishedAt = time.Now().Format(time.RFC3339)
 			a.DurationMs = elapsed.Milliseconds()
@@ -893,25 +899,16 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 				a.Error = err.Error()
 				fmt.Printf("  \033[31m  ✗ %s [%s] failed (%dms): %s\033[0m\n",
 					a.ResourceAddr, a.ActionType, a.DurationMs, err.Error())
+			} else if postErr != nil {
+				a.Status = StatusFailed
+				a.Error = fmt.Sprintf("post-condition failed: %s", postErr.Error())
+				a.PostConditionErr = postErr.Error()
+				fmt.Printf("  \033[31m  ✗ %s [%s] post-condition failed (%dms): %s\033[0m\n",
+					a.ResourceAddr, a.ActionType, a.DurationMs, postErr.Error())
 			} else {
-				if a.PostCondition != "" {
-					postErr := o.runCommand(a.PostCondition, PostConditionTimeout)
-					if postErr != nil {
-						a.Status = StatusFailed
-						a.Error = fmt.Sprintf("post-condition failed: %s", postErr.Error())
-						a.PostConditionErr = postErr.Error()
-						fmt.Printf("  \033[31m  ✗ %s [%s] post-condition failed (%dms): %s\033[0m\n",
-							a.ResourceAddr, a.ActionType, a.DurationMs, postErr.Error())
-					} else {
-						a.Status = StatusSuccess
-						fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
-							a.ResourceAddr, a.ActionType, a.DurationMs)
-					}
-				} else {
-					a.Status = StatusSuccess
-					fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
-						a.ResourceAddr, a.ActionType, a.DurationMs)
-				}
+				a.Status = StatusSuccess
+				fmt.Printf("  \033[32m  ✓ %s [%s] success (%dms)\033[0m\n",
+					a.ResourceAddr, a.ActionType, a.DurationMs)
 			}
 			o.mu.Unlock()
 
@@ -936,30 +933,19 @@ func (o *Orchestrator) runCommand(cmdStr string, timeoutSec int) error {
 		return fmt.Errorf("empty command")
 	}
 
-	cmd := exec.Command(parts[0], parts[1:]...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
 
-	done := make(chan error, 1)
-	var output []byte
-	var cmdErr error
+	cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
+	output, err := cmd.CombinedOutput()
 
-	go func() {
-		output, cmdErr = cmd.CombinedOutput()
-		done <- cmdErr
-	}()
-
-	timeout := time.Duration(timeoutSec) * time.Second
-	select {
-	case <-time.After(timeout):
-		if cmd.Process != nil {
-			cmd.Process.Kill()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("timeout exceeded after %d seconds", timeoutSec)
 		}
-		return fmt.Errorf("timeout exceeded after %d seconds", timeoutSec)
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("%s: %s", err, string(output))
-		}
-		return nil
+		return fmt.Errorf("%s: %s", err, string(output))
 	}
+	return nil
 }
 
 func (o *Orchestrator) executeRollbackByLayer(rollbackLayers [][]*RemediationAction) {
