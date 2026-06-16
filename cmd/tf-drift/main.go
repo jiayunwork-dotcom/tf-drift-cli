@@ -89,6 +89,11 @@ func cmdDetect(args []string) {
 	sortMode := fs.String("sort", "risk", "Sort mode (risk/count)")
 	policyFile := fs.String("policy", "", "Path to policy file (.tfdrift-policy.yaml)")
 	policyCache := fs.String("policy-cache", "", "Path to policy cache file (.tfdrift-policy-cache.json)")
+	remediate := fs.Bool("remediate", false, "Trigger remediation orchestration for drifted resources")
+	dryRun := fs.Bool("dry-run", false, "Output execution plan without actual execution (use with --remediate)")
+	concurrency := fs.Int("concurrency", 4, "Max concurrency per layer during remediation (default: 4)")
+	noRollback := fs.Bool("no-rollback", false, "Skip rollback phase on remediation failure")
+	resume := fs.Bool("resume", false, "Resume from existing remediation state file")
 	fs.Parse(args)
 
 	if *stateFile == "" && *configDir == "" && *noConfig == false {
@@ -170,6 +175,56 @@ func cmdDetect(args []string) {
 	}
 
 	remediation.GenerateRemediations(report.Results, stateMap)
+
+	if *remediate || *dryRun {
+		orchestrator := remediation.NewOrchestrator(report, depGraph,
+			remediation.WithConcurrency(*concurrency),
+			remediation.WithNoRollback(*noRollback),
+			remediation.WithDryRun(*dryRun),
+		)
+
+		if cycleNodes, hasCycle := orchestrator.DetectCycle(); hasCycle {
+			fmt.Fprintf(os.Stderr, "\033[31m\033[1mError: circular dependency detected in remediation DAG\033[0m\n")
+			fmt.Fprintf(os.Stderr, "\033[31mResources in cycle: %s\033[0m\n", strings.Join(cycleNodes, " → "))
+			os.Exit(5)
+		}
+
+		if !*resume {
+			if _, hasIncomplete := orchestrator.CheckExistingState(); hasIncomplete {
+				fmt.Fprintf(os.Stderr, "\033[33m\033[1m⚠ Found incomplete remediation state file (.tfdrift-remediate-state.json)\033[0m\n")
+				fmt.Fprintf(os.Stderr, "  Use --resume to continue or remove the state file to restart\n")
+				os.Exit(1)
+			}
+		} else {
+			if existingState, hasIncomplete := orchestrator.CheckExistingState(); hasIncomplete {
+				fmt.Fprintf(os.Stderr, "\033[36mResuming from existing remediation state...\033[0m\n")
+				orchestrator.ResumeFromState(existingState)
+			} else {
+				fmt.Fprintf(os.Stderr, "\033[33mNo incomplete state file found, starting fresh\033[0m\n")
+			}
+		}
+
+		if *dryRun {
+			if *format == "json" {
+				planData := orchestrator.FormatPlanJSON()
+				b, err := json.MarshalIndent(planData, "", "  ")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error formatting plan: %v\n", err)
+					os.Exit(1)
+				}
+				writeOutput(string(b), *output)
+			} else {
+				writeOutput(orchestrator.FormatPlanTerminal(), *output)
+			}
+			os.Exit(0)
+		}
+
+		fmt.Fprintf(os.Stderr, "\033[1m\033[36m═══ Starting Remediation ═══\033[0m\n")
+		if err := orchestrator.Execute(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 
 	stateFileAbs, _ := filepath.Abs(*stateFile)
 	configDirAbs, _ := filepath.Abs(*configDir)
@@ -451,7 +506,8 @@ func printEnvTerminal(matrix []map[string]interface{}, envNames []string) {
 
 func printEnvMarkdown(matrix []map[string]interface{}, envNames []string) {
 	sort.Strings(envNames)
-	fmt.Println("# Environment Comparison\n")
+	fmt.Println("# Environment Comparison")
+	fmt.Println()
 	header := "| Resource | Attribute | " + strings.Join(envNames, " | ") + " | Note |"
 	sep := "|" + strings.Repeat("---|", len(envNames)+3)
 	fmt.Println(header)
