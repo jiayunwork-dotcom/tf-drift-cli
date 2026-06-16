@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,19 +55,19 @@ type ActionLayer struct {
 }
 
 type ExecutionPlan struct {
-	Layers              []*ActionLayer       `json:"layers"`
-	CriticalPath        []string             `json:"critical_path"`
-	EstimatedParallelism float64             `json:"estimated_parallelism"`
-	TotalActions        int                  `json:"total_actions"`
-	TotalLayers         int                  `json:"total_layers"`
+	Layers               []*ActionLayer `json:"layers"`
+	CriticalPath         []string       `json:"critical_path"`
+	EstimatedParallelism float64        `json:"estimated_parallelism"`
+	TotalActions         int            `json:"total_actions"`
+	TotalLayers          int            `json:"total_layers"`
 }
 
 type RemediateState struct {
-	Actions  []*RemediationAction `json:"actions"`
-	Plan     *ExecutionPlan       `json:"plan"`
-	StartedAt string              `json:"started_at"`
-	UpdatedAt string              `json:"updated_at"`
-	Finished  bool                `json:"finished"`
+	Actions   []*RemediationAction `json:"actions"`
+	Plan      *ExecutionPlan       `json:"plan"`
+	StartedAt string               `json:"started_at"`
+	UpdatedAt string               `json:"updated_at"`
+	Finished  bool                 `json:"finished"`
 }
 
 type Orchestrator struct {
@@ -79,6 +80,7 @@ type Orchestrator struct {
 	noRollback  bool
 	dryRun      bool
 	mu          sync.Mutex
+	writeMu     sync.Mutex
 }
 
 func computeActionID(resourceAddr, driftType, attributePath string) string {
@@ -195,26 +197,13 @@ func (o *Orchestrator) buildActions(report *models.DriftReport) {
 
 		id := computeActionID(resourceAddr, string(primaryDrift.DriftType), primaryDrift.AttributePath)
 
-		var dependsOn []string
-		if o.depGraph != nil {
-			upstream := o.depGraph.GetUpstream(resourceAddr)
-			for depAddr := range upstream {
-				depID := computeActionID(depAddr, "", "*")
-				if _, exists := resourceActions[depAddr]; exists {
-					dependsOn = append(dependsOn, resourceActions[depAddr].ID)
-				} else {
-					dependsOn = append(dependsOn, depID)
-				}
-			}
-		}
-
 		action := &RemediationAction{
 			ID:           id,
 			ResourceAddr: resourceAddr,
 			ActionType:   actionType,
 			Command:      cmd,
 			RollbackCmd:  rollbackCmd,
-			DependsOn:    dependsOn,
+			DependsOn:    []string{},
 			Status:       StatusPending,
 			RiskLevel:    string(result.MaxRisk),
 			DriftType:    string(primaryDrift.DriftType),
@@ -226,21 +215,22 @@ func (o *Orchestrator) buildActions(report *models.DriftReport) {
 	}
 
 	for _, action := range o.actions {
-		var validDeps []string
-		for _, depID := range action.DependsOn {
-			if _, exists := o.actionMap[depID]; exists {
-				validDeps = append(validDeps, depID)
+		if o.depGraph != nil {
+			upstream := o.depGraph.GetUpstream(action.ResourceAddr)
+			for depAddr := range upstream {
+				if depAction, exists := resourceActions[depAddr]; exists {
+					action.DependsOn = append(action.DependsOn, depAction.ID)
+				}
 			}
 		}
-		action.DependsOn = validDeps
 	}
 }
 
 func (o *Orchestrator) buildDAG() {
 	if len(o.actions) == 0 {
 		o.plan = &ExecutionPlan{
-			Layers:      []*ActionLayer{},
-			TotalLayers: 0,
+			Layers:       []*ActionLayer{},
+			TotalLayers:  0,
 			TotalActions: 0,
 		}
 		return
@@ -509,27 +499,53 @@ func (o *Orchestrator) loadState() (*RemediateState, bool) {
 }
 
 func (o *Orchestrator) saveState() error {
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+
 	now := time.Now().Format(time.RFC3339)
+
+	o.mu.Lock()
+	finished := true
+	for _, a := range o.actions {
+		if a.Status == StatusPending || a.Status == StatusRunning {
+			finished = false
+			break
+		}
+	}
+
+	actionsCopy := make([]*RemediationAction, len(o.actions))
+	copy(actionsCopy, o.actions)
+	o.mu.Unlock()
+
 	state := &RemediateState{
-		Actions:   o.actions,
+		Actions:   actionsCopy,
 		Plan:      o.plan,
 		StartedAt: now,
 		UpdatedAt: now,
-	}
-
-	for _, a := range o.actions {
-		if a.Status == StatusPending || a.Status == StatusRunning {
-			state.Finished = false
-			break
-		}
-		state.Finished = true
+		Finished:  finished,
 	}
 
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(o.stateFile, data, 0644)
+
+	tmpPath := o.stateFile + ".tmp"
+	dir := filepath.Dir(o.stateFile)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, o.stateFile); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (o *Orchestrator) CheckExistingState() (*RemediateState, bool) {
@@ -557,6 +573,10 @@ func (o *Orchestrator) ResumeFromState(state *RemediateState) {
 	o.plan = state.Plan
 }
 
+func isActionFinished(status ActionStatus) bool {
+	return status == StatusSuccess || status == StatusRolledBack || status == StatusFailed
+}
+
 func (o *Orchestrator) Execute() error {
 	if o.dryRun {
 		return nil
@@ -565,33 +585,80 @@ func (o *Orchestrator) Execute() error {
 	o.saveState()
 
 	var failedActions []*RemediationAction
-	var successActions []*RemediationAction
+	var completedSuccess []*RemediationAction
+	rollbackLayers := make([][]*RemediationAction, 0, len(o.plan.Layers))
+	hitFailure := false
 
-	for _, layer := range o.plan.Layers {
-		fmt.Printf("\n\033[1m[Layer %d/%d]\033[0m Executing %d action(s) (concurrency: %d)\n",
-			layer.Level+1, o.plan.TotalLayers, len(layer.Actions), o.concurrency)
+	for layerIdx, layer := range o.plan.Layers {
+		var toExecute []*RemediationAction
+		var skipped []*RemediationAction
 
-		results := o.executeLayer(layer)
+		o.mu.Lock()
+		for _, a := range layer.Actions {
+			if isActionFinished(a.Status) {
+				skipped = append(skipped, a)
+			} else {
+				toExecute = append(toExecute, a)
+			}
+		}
+		o.mu.Unlock()
 
-		layerFailed := false
-		for _, r := range results {
-			if r.Status == StatusSuccess {
-				successActions = append(successActions, r)
-			} else if r.Status == StatusFailed {
-				failedActions = append(failedActions, r)
-				layerFailed = true
+		if len(skipped) > 0 {
+			fmt.Printf("\n\033[1m[Layer %d/%d]\033[0m Skipping %d already completed action(s)\n",
+				layerIdx+1, o.plan.TotalLayers, len(skipped))
+			for _, a := range skipped {
+				fmt.Printf("  \033[2m  ⊘ %s [%s] already %s\033[0m\n",
+					a.ResourceAddr, a.ActionType, a.Status)
 			}
 		}
 
-		if layerFailed {
-			fmt.Printf("\n\033[31m\033[1m✗ Layer %d had failures, skipping remaining layers\033[0m\n", layer.Level+1)
+		if len(toExecute) > 0 {
+			fmt.Printf("\n\033[1m[Layer %d/%d]\033[0m Executing %d action(s) (concurrency: %d)\n",
+				layerIdx+1, o.plan.TotalLayers, len(toExecute), o.concurrency)
+		}
+
+		var layerSuccess []*RemediationAction
+		var layerFailed []*RemediationAction
+
+		if len(toExecute) > 0 {
+			subLayer := &ActionLayer{Level: layer.Level, Actions: toExecute}
+			results := o.executeLayer(subLayer)
+
+			for _, r := range results {
+				if r.Status == StatusSuccess {
+					layerSuccess = append(layerSuccess, r)
+					completedSuccess = append(completedSuccess, r)
+				} else if r.Status == StatusFailed {
+					layerFailed = append(layerFailed, r)
+					failedActions = append(failedActions, r)
+				}
+			}
+		} else {
+			o.mu.Lock()
+			for _, a := range layer.Actions {
+				if a.Status == StatusSuccess {
+					layerSuccess = append(layerSuccess, a)
+					completedSuccess = append(completedSuccess, a)
+				} else if a.Status == StatusFailed {
+					layerFailed = append(layerFailed, a)
+					failedActions = append(failedActions, a)
+				}
+			}
+			o.mu.Unlock()
+		}
+
+		rollbackLayers = append([][]*RemediationAction{layerSuccess}, rollbackLayers...)
+
+		if len(layerFailed) > 0 {
+			hitFailure = true
+			fmt.Printf("\n\033[31m\033[1m✗ Layer %d had failures, skipping remaining layers\033[0m\n", layerIdx+1)
 			break
 		}
 	}
 
-	if len(failedActions) > 0 && !o.noRollback {
-		fmt.Printf("\n\033[33m\033[1m⚠ Entering rollback phase (%d actions to roll back)\033[0m\n", len(successActions))
-		o.executeRollback(successActions)
+	if hitFailure && !o.noRollback && len(completedSuccess) > 0 {
+		fmt.Printf("\n\033[33m\033[1m⚠ Entering rollback phase (%d actions to roll back)\033[0m\n", len(completedSuccess))
+		o.executeRollbackByLayer(rollbackLayers)
 	}
 
 	if len(failedActions) > 0 {
@@ -619,11 +686,18 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 			defer func() { <-sem }()
 
 			o.mu.Lock()
+			if isActionFinished(a.Status) {
+				o.mu.Unlock()
+				results[idx] = a
+				return
+			}
 			a.Status = StatusRunning
 			a.StartedAt = time.Now().Format(time.RFC3339)
 			o.mu.Unlock()
 
-			o.saveState()
+			if err := o.saveState(); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to save state: %v\n", err)
+			}
 
 			fmt.Printf("  \033[36m[Layer %d/%d]\033[0m 执行: %s (%s)\n",
 				layer.Level+1, o.plan.TotalLayers, a.ResourceAddr, string(a.ActionType))
@@ -647,7 +721,9 @@ func (o *Orchestrator) executeLayer(layer *ActionLayer) []*RemediationAction {
 			}
 			o.mu.Unlock()
 
-			o.saveState()
+			if err := o.saveState(); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to save state: %v\n", err)
+			}
 			results[idx] = a
 		}(i, action)
 	}
@@ -674,26 +750,48 @@ func (o *Orchestrator) runCommand(cmdStr string) error {
 	return nil
 }
 
-func (o *Orchestrator) executeRollback(successActions []*RemediationAction) {
-	for i := len(successActions) - 1; i >= 0; i-- {
-		action := successActions[i]
-		if action.RollbackCmd == "" {
-			fmt.Printf("  \033[2m  ⊘ %s [%s] no rollback command\033[0m\n", action.ResourceAddr, action.ActionType)
+func (o *Orchestrator) executeRollbackByLayer(rollbackLayers [][]*RemediationAction) {
+	for layerIdx, layerActions := range rollbackLayers {
+		if len(layerActions) == 0 {
 			continue
 		}
+		fmt.Printf("  \033[33m\033[1mRollback Layer %d/%d:\033[0m %d action(s)\n",
+			layerIdx+1, len(rollbackLayers), len(layerActions))
 
-		fmt.Printf("  \033[33m  ↩ Rolling back: %s [%s]\033[0m\n", action.ResourceAddr, action.ActionType)
-		err := o.runCommand(action.RollbackCmd)
+		for _, action := range layerActions {
+			o.mu.Lock()
+			status := action.Status
+			o.mu.Unlock()
 
-		o.mu.Lock()
-		if err != nil {
-			fmt.Printf("  \033[31m  ⚠ Rollback failed for %s: %s (continuing)\033[0m\n", action.ResourceAddr, err.Error())
-		} else {
-			action.Status = StatusRolledBack
-			fmt.Printf("  \033[32m  ✓ Rolled back: %s\033[0m\n", action.ResourceAddr)
+			if status == StatusRolledBack || status == StatusFailed {
+				fmt.Printf("    \033[2m  ⊘ %s [%s] already %s, skipping\033[0m\n",
+					action.ResourceAddr, action.ActionType, status)
+				continue
+			}
+
+			if action.RollbackCmd == "" {
+				fmt.Printf("    \033[2m  ⊘ %s [%s] no rollback command\033[0m\n",
+					action.ResourceAddr, action.ActionType)
+				continue
+			}
+
+			fmt.Printf("    \033[33m  ↩ Rolling back: %s [%s]\033[0m\n",
+				action.ResourceAddr, action.ActionType)
+			err := o.runCommand(action.RollbackCmd)
+
+			o.mu.Lock()
+			if err != nil {
+				fmt.Printf("    \033[31m  ⚠ Rollback failed for %s: %s (continuing)\033[0m\n",
+					action.ResourceAddr, err.Error())
+			} else {
+				action.Status = StatusRolledBack
+				fmt.Printf("    \033[32m  ✓ Rolled back: %s\033[0m\n", action.ResourceAddr)
+			}
+			o.mu.Unlock()
+
+			if err := o.saveState(); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to save state: %v\n", err)
+			}
 		}
-		o.mu.Unlock()
-
-		o.saveState()
 	}
 }
