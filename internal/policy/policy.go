@@ -68,8 +68,9 @@ type Policy struct {
 }
 
 type PolicyFile struct {
-	Extends  string    `yaml:"extends"`
-	Policies []*Policy `yaml:"policies"`
+	Extends     string    `yaml:"extends"`
+	Policies    []*Policy `yaml:"policies"`
+	SourceFiles []string  `yaml:"-"`
 }
 
 type rawPolicyFile struct {
@@ -158,6 +159,28 @@ func ComputePolicyFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func ComputePolicyFilesSHA256(paths []string) (string, error) {
+	h := sha256.New()
+	sortedPaths := make([]string, len(paths))
+	copy(sortedPaths, paths)
+	sort.Strings(sortedPaths)
+	for _, p := range sortedPaths {
+		absPath, err := filepath.Abs(p)
+		if err != nil {
+			return "", err
+		}
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return "", err
+		}
+		h.Write([]byte(filepath.Clean(absPath)))
+		h.Write([]byte{0})
+		h.Write(data)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func LoadPolicyCache(path string) (*PolicyCache, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil, nil
@@ -211,6 +234,7 @@ func LoadPolicyFile(path string) (*PolicyFile, error) {
 		if err != nil {
 			return fmt.Errorf("failed to resolve path %s: %w", currentPath, err)
 		}
+		absCurrent = filepath.Clean(absCurrent)
 
 		for _, anc := range ancestors {
 			if anc == absCurrent {
@@ -249,8 +273,10 @@ func LoadPolicyFile(path string) (*PolicyFile, error) {
 		if raw.Extends != "" {
 			parentPath := raw.Extends
 			if !filepath.IsAbs(parentPath) {
-				parentPath = filepath.Join(filepath.Dir(absCurrent), parentPath)
+				parentDir := filepath.Dir(absCurrent)
+				parentPath = filepath.Join(parentDir, parentPath)
 			}
+			parentPath = filepath.Clean(parentPath)
 			if err := loadRecursive(parentPath, newAncestors); err != nil {
 				return err
 			}
@@ -268,9 +294,11 @@ func LoadPolicyFile(path string) (*PolicyFile, error) {
 	mergedPolicies := []*Policy{}
 	idOrder := []string{}
 	idMap := make(map[string]*Policy)
+	sourceFiles := make([]string, 0, len(loadOrder))
 
 	for _, absKey := range loadOrder {
 		loaded := loadedMap[absKey]
+		sourceFiles = append(sourceFiles, absKey)
 		for _, p := range loaded.policies {
 			if _, exists := idMap[p.ID]; !exists {
 				idOrder = append(idOrder, p.ID)
@@ -284,7 +312,8 @@ func LoadPolicyFile(path string) (*PolicyFile, error) {
 	}
 
 	pf := &PolicyFile{
-		Policies: mergedPolicies,
+		Policies:    mergedPolicies,
+		SourceFiles: sourceFiles,
 	}
 
 	if err := pf.Validate(); err != nil {
@@ -473,14 +502,33 @@ func (p *Policy) Matches(drift *models.DriftItem, resourceType string) bool {
 		}
 	}
 
-	rtMatched := matchResourceTypes(p.Match.ResourceTypes, resourceType)
-	attrMatched := matchAttributes(p.Match.Attributes, drift.AttributePath)
-	dtMatched := matchDriftTypes(p.Match.DriftTypes, drift.DriftType)
+	hasRT := len(p.Match.ResourceTypes) > 0
+	hasAttr := len(p.Match.Attributes) > 0
+	hasDT := len(p.Match.DriftTypes) > 0
 
 	if condMode == ConditionModeAll {
-		return rtMatched && attrMatched && dtMatched
+		if hasRT && !matchResourceTypes(p.Match.ResourceTypes, resourceType) {
+			return false
+		}
+		if hasAttr && !matchAttributes(p.Match.Attributes, drift.AttributePath) {
+			return false
+		}
+		if hasDT && !matchDriftTypes(p.Match.DriftTypes, drift.DriftType) {
+			return false
+		}
+		return true
 	} else {
-		return rtMatched || attrMatched || dtMatched
+		anyMatched := false
+		if hasRT && matchResourceTypes(p.Match.ResourceTypes, resourceType) {
+			anyMatched = true
+		}
+		if hasAttr && matchAttributes(p.Match.Attributes, drift.AttributePath) {
+			anyMatched = true
+		}
+		if hasDT && matchDriftTypes(p.Match.DriftTypes, drift.DriftType) {
+			anyMatched = true
+		}
+		return anyMatched
 	}
 }
 

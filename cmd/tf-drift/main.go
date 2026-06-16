@@ -203,7 +203,7 @@ func cmdDetect(args []string) {
 		}
 
 		if *policyCache != "" {
-			policySHA, err := policy.ComputePolicyFileSHA256(*policyFile)
+			policySHA, err := policy.ComputePolicyFilesSHA256(pf.SourceFiles)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to compute policy file hash: %v\n", err)
 			}
